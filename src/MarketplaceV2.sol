@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC2981.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title PentagonMarketplaceV2
  * @notice NFT Marketplace for Pentagon Chain with fixed fee handling
- * @dev Fees are included in bid approval amount. Min bid enforced. Admin cancel supported.
+ * @dev V2.1 — SafeERC20, consistent fee logic, underflow protection
  */
 contract PentagonMarketplaceV2 is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
     // ─── Structs ────────────────────────────────────────────────
     struct Listing {
@@ -123,25 +125,34 @@ contract PentagonMarketplaceV2 is Ownable, ReentrancyGuard {
                 royaltyAmount = amount;
             } catch {}
 
+            // FIX #2: underflow protection — fee + royalty must not exceed price
+            require(fee + royaltyAmount <= price, "Fee + royalty exceeds price");
+
             address seller = listing.seller;
 
             if (listing.paymentToken == address(0)) {
                 // Native PC payment
+                // FIX #1: consistent fee — seller pays fee, same as ERC20 path
+                // Buyer sends: price + fee
+                // Seller gets: price - fee - royalty
+                // Contract keeps: fee * 2 (implicit from msg.value remainder)
                 uint256 totalPrice = price + fee;
                 totalRequired += totalPrice;
-                uint256 sellerProceeds = price - royaltyAmount;
+                uint256 sellerProceeds = price - fee - royaltyAmount;
 
                 IERC721(collection).safeTransferFrom(seller, msg.sender, tokenIds[i]);
                 payable(seller).transfer(sellerProceeds);
                 if (royaltyAmount > 0) payable(royaltyReceiver).transfer(royaltyAmount);
+                // fee * 2 stays in contract (fee from buyer via msg.value, fee from seller deduction)
             } else {
                 // ERC20 payment
                 uint256 sellerProceeds = price - fee - royaltyAmount;
 
                 IERC721(collection).safeTransferFrom(seller, msg.sender, tokenIds[i]);
-                IERC20(listing.paymentToken).transferFrom(msg.sender, seller, sellerProceeds);
-                if (royaltyAmount > 0) IERC20(listing.paymentToken).transferFrom(msg.sender, royaltyReceiver, royaltyAmount);
-                IERC20(listing.paymentToken).transferFrom(msg.sender, address(this), fee);
+                // FIX #3: SafeERC20
+                IERC20(listing.paymentToken).safeTransferFrom(msg.sender, seller, sellerProceeds);
+                if (royaltyAmount > 0) IERC20(listing.paymentToken).safeTransferFrom(msg.sender, royaltyReceiver, royaltyAmount);
+                IERC20(listing.paymentToken).safeTransferFrom(msg.sender, address(this), fee);
             }
 
             emit NFTSold(collection, tokenIds[i], msg.sender, price, listing.paymentToken);
@@ -218,14 +229,18 @@ contract PentagonMarketplaceV2 is Ownable, ReentrancyGuard {
                 royaltyAmount = amount;
             } catch {}
 
+            // FIX #2: underflow protection
+            require(fee + royaltyAmount <= bid.price, "Fee + royalty exceeds bid price");
+
             // Seller gets: price - fee - royalty
             uint256 sellerProceeds = bid.price - fee - royaltyAmount;
 
             // Pull from bidder: sellerProceeds + royalty + (fee * 2)
             // = (price - fee - royalty) + royalty + 2*fee = price + fee
-            token.transferFrom(bid.bidder, msg.sender, sellerProceeds);
-            if (royaltyAmount > 0) token.transferFrom(bid.bidder, royaltyReceiver, royaltyAmount);
-            token.transferFrom(bid.bidder, address(this), fee * 2);
+            // FIX #3: SafeERC20
+            token.safeTransferFrom(bid.bidder, msg.sender, sellerProceeds);
+            if (royaltyAmount > 0) token.safeTransferFrom(bid.bidder, royaltyReceiver, royaltyAmount);
+            token.safeTransferFrom(bid.bidder, address(this), fee * 2);
 
             nft.safeTransferFrom(msg.sender, bid.bidder, tokenIds[i]);
 
@@ -278,7 +293,7 @@ contract PentagonMarketplaceV2 is Ownable, ReentrancyGuard {
             payable(owner()).transfer(amount);
             emit FundsWithdrawn(owner(), amount);
         } else {
-            IERC20(token).transfer(owner(), amount);
+            IERC20(token).safeTransfer(owner(), amount);
             emit TokensWithdrawn(owner(), token, amount);
         }
     }
