@@ -254,11 +254,43 @@ forge script script/Deploy.s.sol:DeployMarketplaceV2 \
 
 ## Planned: PentagonAuctionHouse Contract
 
-A new standalone contract to add three features currently missing from the marketplace:
+A standalone contract adding three features built around **real auction house mechanics**, not glorified timed listings.
+
+Design philosophy: steal from Christie's and Sotheby's, not OpenSea.
+
+### Contract Architecture (Planned)
+
+```mermaid
+flowchart TD
+    subgraph "PentagonMarketplaceV2 (LIVE)"
+        L[Fixed-Price Listings]
+        CB[Collection Bids]
+    end
+
+    subgraph "PentagonAuctionHouse (PLANNED)"
+        PB[Private Bids — bid on specific NFTs]
+        PS[Private Sales — designated buyer, no fee]
+        LA[Live Auctions — scheduled, soft-close, bid log]
+        RA[Reserve Auctions — hidden reserve, revealed on hit]
+        SB[Sealed Bids — blind bidding for high-value pieces]
+    end
+
+    L -.-> |"existing"| FEE[Fee System: per-collection bps]
+    CB -.-> FEE
+    PB --> FEE
+    LA --> FEE
+    RA --> FEE
+    SB --> FEE
+    PS -.-> |"NO fee"| FREE[Free Service]
+```
+
+Both contracts share whitelisted collections and fee config (new contract can read from V2.1 or duplicate admin setup).
+
+---
 
 ### 1. Private Bids (Token-Specific Bids)
 
-Bid on a **specific NFT** (by collection + tokenId) rather than any NFT in a collection.
+Anyone can bid on a **specific NFT they don't own**. Not a collection-wide offer, a direct bid on a particular piece.
 
 ```mermaid
 sequenceDiagram
@@ -275,7 +307,11 @@ sequenceDiagram
         Contract->>Owner: transfer(price - fee - royalty)
         Contract->>Bidder: transfer NFT
         Contract-->>Owner: PrivateBidAccepted event
-    else Bid expires or bidder cancels
+    else Bid expires
+        Note over Contract: After duration passes
+        Bidder->>Contract: withdrawExpiredBid(bidId)
+        Contract->>Bidder: refund escrowed funds
+    else Bidder cancels early
         Bidder->>Contract: cancelPrivateBid(bidId)
         Contract->>Bidder: refund escrowed funds
     end
@@ -283,15 +319,18 @@ sequenceDiagram
 
 **Rules:**
 - Minimum bid: 0.01 PC, increments of 0.01 PC
-- Duration-based expiry (bidder sets)
+- Duration-based expiry (bidder sets how long the offer stands)
 - Multiple bids per NFT from different bidders allowed
-- Funds escrowed on bid placement (pulled from bidder)
+- Funds escrowed on placement (pulled from bidder immediately)
 - Marketplace fee applies (same 2.5% structure)
-- Bidder can cancel anytime (if not accepted). Auto-refund on expiry.
+- Bidder can cancel anytime before acceptance. Auto-refund after expiry via `withdrawExpiredBid()`.
+- One bid per bidder per NFT (update replaces, prevents spam)
 
-### 2. Private Sales
+---
 
-NFT owner creates a sale that **only one specific address** can buy.
+### 2. Private Sales (Designated Buyer)
+
+Owner picks exactly who can buy. Peer-to-peer, no middleman fee.
 
 ```mermaid
 sequenceDiagram
@@ -299,29 +338,90 @@ sequenceDiagram
     participant Contract as AuctionHouse
     participant Buyer as Designated Buyer
 
-    Owner->>Contract: createPrivateSale(collection, tokenId, price, buyer, paymentToken)
-    Note over Contract: One active private sale per NFT per owner
+    Owner->>Contract: createPrivateSale(collection, tokenId, price, buyerAddress, paymentToken)
+    Note over Contract: One active sale per NFT per owner max
     Contract-->>Owner: PrivateSaleCreated event
 
     Buyer->>Contract: executePrivateSale(saleId) + payment
-    Contract->>Owner: transfer payment (NO fee)
+    Contract->>Owner: transfer full payment (NO fee deducted)
     Contract->>Buyer: transfer NFT
     Contract-->>Buyer: PrivateSaleExecuted event
 
-    Note over Owner: Can cancel anytime
+    Note over Owner: Owner can cancel anytime before execution
     Owner->>Contract: cancelPrivateSale(saleId)
 ```
 
 **Rules:**
-- **No marketplace fee** (free service, peer-to-peer)
-- Only the designated `buyer` address can execute
-- One active private sale per NFT per owner (prevents spam/abuse)
-- Owner can cancel anytime
+- **No marketplace fee** (free service, encourages usage)
+- Only the designated `buyerAddress` can execute the purchase
+- **One active private sale per NFT per owner** (prevents spam/abuse)
+- Owner can cancel anytime before buyer executes
 - Supports native PC or ERC-20 payment
+- No duration (stays active until executed or cancelled)
 
-### 3. Auctions (English Auction, OpenSea-style)
+---
 
-Owner starts a timed auction. Highest bidder wins.
+### 3. Live Auctions (Scheduled, Soft-Close, Bid Log)
+
+Real auction mechanics. Scheduled start time, countdown, and a soft-close window that kills sniping.
+
+```mermaid
+sequenceDiagram
+    participant Owner as NFT Owner
+    participant Contract as AuctionHouse
+    participant B1 as Bidder 1
+    participant B2 as Bidder 2
+    participant Anyone
+
+    Owner->>Contract: createAuction(collection, tokenId, startPrice, duration, startTime, paymentToken)
+    Note over Contract: NFT escrowed. Auction starts at startTime.
+    Contract-->>Owner: AuctionCreated event
+
+    Note over Contract: ⏰ startTime reached — auction is LIVE
+
+    B1->>Contract: bid(auctionId) + funds
+    Note over Contract: Escrow bid. Must beat startPrice.
+    Contract-->>B1: BidPlaced(auctionId, bidder, amount, timestamp)
+
+    B2->>Contract: bid(auctionId) + higher funds
+    Contract->>B1: refund previous bid immediately
+    Contract-->>B2: BidPlaced event
+
+    B2->>Contract: increaseBid(auctionId) + additional funds
+    Note over Contract: Top up existing bid without losing position
+    Contract-->>B2: BidIncreased event
+
+    Note over Contract: 🔥 SOFT-CLOSE: bid in last 10 min → extend 10 min
+    B1->>Contract: bid(auctionId) + even higher funds
+    Note over Contract: endTime += 10 minutes (anti-sniping)
+    Contract->>B2: refund previous bid
+    Contract-->>B1: BidPlaced + AuctionExtended events
+
+    Note over Contract: ⏰ endTime reached, no more bids in window
+
+    Anyone->>Contract: settleAuction(auctionId)
+    Contract->>Owner: transfer(winningBid - fee - royalty)
+    Contract->>B1: transfer NFT to winner
+    Contract-->>Anyone: AuctionSettled event
+```
+
+**Rules:**
+- **Scheduled start:** Owner sets a future `startTime`. No bids accepted before it.
+- **Soft-close (anti-sniping):** Any bid placed within 10 minutes of `endTime` extends the auction by 10 minutes. Repeats indefinitely until 10 minutes pass with no bids.
+- **Live bid log:** Every bid emits `BidPlaced(auctionId, bidder, amount, timestamp)` for frontend to render a live feed.
+- **Bid increments:** Must exceed current highest by at least 0.01 PC.
+- **Increase bid:** Current highest bidder can top up their bid (keeps position).
+- **Outbid refund:** Previous highest bidder gets an immediate refund when outbid.
+- **Settlement:** Anyone can call `settleAuction()` after `endTime`. Permissionless finalization.
+- **Escrow model:** NFT held by contract from creation. Winning bid funds held until settlement.
+- **Fee + royalties** charged on successful settlement.
+- **No bids?** Owner can reclaim NFT after `endTime` via `reclaimUnsold(auctionId)`.
+
+---
+
+### 4. Reserve Auctions (Hidden Reserve, Revealed on Hit)
+
+Same mechanics as live auctions, plus a hidden reserve price. Bidders don't know the floor until someone hits it.
 
 ```mermaid
 sequenceDiagram
@@ -330,71 +430,88 @@ sequenceDiagram
     participant B1 as Bidder 1
     participant B2 as Bidder 2
 
-    Owner->>Contract: createAuction(collection, tokenId, startPrice, reservePrice, duration, paymentToken)
-    Note over Contract: NFT transferred to contract (escrow)
-    Contract-->>Owner: AuctionCreated event
+    Owner->>Contract: createReserveAuction(collection, tokenId, startPrice, reservePrice, duration, startTime, paymentToken)
+    Note over Contract: reservePrice stored as hash (hidden on-chain)
+    Contract-->>Owner: ReserveAuctionCreated event
 
-    B1->>Contract: placeBid(auctionId) + funds
-    Note over Contract: Escrow bid amount
-    Contract-->>B1: AuctionBidPlaced event
+    B1->>Contract: bid(auctionId) + funds below reserve
+    Note over Contract: Bid accepted but reserve NOT met
+    Contract-->>B1: BidPlaced (reserveMet: false)
 
-    B2->>Contract: placeBid(auctionId) + higher funds
-    Contract->>B1: refund previous bid
-    Note over Contract: If < 10 min left, extend by 10 min
-    Contract-->>B2: AuctionBidPlaced event
+    B2->>Contract: bid(auctionId) + funds >= reserve
+    Contract->>B1: refund
+    Note over Contract: 🎯 RESERVE MET — revealed to all bidders
+    Contract-->>B2: BidPlaced (reserveMet: true) + ReserveRevealed event
 
-    B2->>Contract: increaseBid(auctionId) + additional funds
-    Note over Contract: Add to existing bid
-    Contract-->>B2: AuctionBidIncreased event
+    Note over Contract: From here, normal soft-close auction rules apply
 
-    Note over Contract: Auction ends (duration reached)
-
-    alt Reserve met
-        Anyone->>Contract: settleAuction(auctionId)
-        Contract->>Owner: transfer(winningBid - fee - royalty)
-        Contract->>B2: transfer NFT
-        Contract-->>B2: AuctionSettled event
-    else Reserve NOT met
-        Owner->>Contract: cancelAuction(auctionId)
+    alt Reserve met → settleAuction
+        Contract->>Owner: proceeds
+        Contract->>B2: NFT
+    else Reserve NOT met at end
+        Owner->>Contract: cancelReserveAuction(auctionId)
         Contract->>Owner: return NFT
-        Contract->>B2: refund bid
+        Contract->>B1: refund highest bid
     end
 ```
 
 **Rules:**
-- **Anti-sniping:** Bids in the last 10 minutes extend the auction by 10 minutes (OpenSea model)
-- **Reserve price:** Optional. If set and not met, owner can cancel and reclaim NFT
-- **No reserve:** Sells to highest bidder regardless of final price
-- **Bid increments:** Each new bid must exceed current highest by at least 0.01 PC
-- **Increase bid:** Existing highest bidder can add to their bid without losing position
-- **Settlement:** Anyone can call `settleAuction()` after end time. Finalizes transfer + payment.
-- **Escrow model:** NFT held by contract during auction, bids escrowed on placement
-- **Fee charged** on successful settlement (same basis-point structure)
-- **ERC-2981 royalties** honored on settlement
+- **Hidden reserve:** Stored as `keccak256(reservePrice, salt)` on-chain. Not visible until met.
+- **Reserve reveal:** When a bid meets or exceeds reserve, contract emits `ReserveRevealed(auctionId, reservePrice)`. From that point it's a normal auction.
+- **Reserve not met:** Owner can cancel after `endTime` and reclaim NFT + all bids refunded.
+- **Soft-close still applies** once reserve is met.
+- All other live auction rules carry over.
 
-### Contract Architecture (Planned)
+---
+
+### 5. Sealed Bids (Blind Auction for High-Value Pieces)
+
+Commit-reveal pattern. Nobody sees anyone else's bid until the reveal phase.
 
 ```mermaid
-flowchart TD
-    subgraph "PentagonMarketplaceV2 (LIVE)"
-        L[Fixed-Price Listings]
-        CB[Collection Bids]
+sequenceDiagram
+    participant Owner as NFT Owner
+    participant Contract as AuctionHouse
+    participant B1 as Bidder 1
+    participant B2 as Bidder 2
+
+    Owner->>Contract: createSealedAuction(collection, tokenId, minBid, bidPhaseEnd, revealPhaseEnd, paymentToken)
+    Note over Contract: NFT escrowed
+    Contract-->>Owner: SealedAuctionCreated event
+
+    rect rgb(240, 240, 255)
+        Note over Contract: 📦 BID PHASE (commit)
+        B1->>Contract: commitBid(auctionId, hash) + escrow deposit
+        Note over Contract: hash = keccak256(amount, salt)
+        B2->>Contract: commitBid(auctionId, hash) + escrow deposit
     end
 
-    subgraph "PentagonAuctionHouse (PLANNED)"
-        PB[Private Bids — bid on specific NFT]
-        PS[Private Sales — designated buyer only]
-        AU[Auctions — timed, highest bidder wins]
+    rect rgb(255, 240, 240)
+        Note over Contract: 🔓 REVEAL PHASE
+        B1->>Contract: revealBid(auctionId, amount, salt)
+        Note over Contract: Verify hash matches. Refund excess deposit.
+        B2->>Contract: revealBid(auctionId, amount, salt)
+        Note over Contract: If amount > deposit, bid is invalid (disqualified)
     end
 
-    L -.-> |"existing"| FEE[Fee System: per-collection bps]
-    CB -.-> FEE
-    PB --> FEE
-    AU --> FEE
-    PS -.-> |"NO fee"| FREE[Free Service]
+    Note over Contract: ⏰ revealPhaseEnd reached
+
+    Contract->>Contract: Highest valid revealed bid wins
+    Contract->>Owner: transfer(winningBid - fee - royalty)
+    Contract->>B1: transfer NFT to winner
+    Contract->>B2: refund deposit
+    Contract-->>Owner: SealedAuctionSettled event
 ```
 
-Both contracts share the same whitelisted collections and fee configuration (or the new contract reads from V2.1, or duplicates the admin setup).
+**Rules:**
+- **Two phases:** Commit (bid phase) then Reveal.
+- **Commit:** Bidder submits `keccak256(amount, salt)` + deposits at least `minBid` as escrow. Actual bid amount is hidden.
+- **Reveal:** Bidder reveals `amount` and `salt`. Contract verifies hash. If `amount > deposit`, bid is disqualified (can't bid more than you escrowed).
+- **Unrevealed bids:** Deposit is forfeited after reveal phase (incentivizes revealing).
+- **Winner:** Highest valid revealed bid. Ties broken by earlier commit timestamp.
+- **Settlement:** Automatic after reveal phase ends. Anyone can call `settleSealedAuction()`.
+- **Fee + royalties** on winning amount.
+- **Use case:** High-value 1/1s, flagship drops, situations where visible bidding creates psychological pressure or collusion risk.
 
 ---
 
