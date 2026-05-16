@@ -2,13 +2,39 @@
 
 NFT Marketplace smart contracts for **Pentagon Chain** (Chain ID: 3344).
 
+## Branches
+
+| Branch | Description | Status |
+|--------|-------------|--------|
+| `main` | **V1 (Production)** — Fixed-price listings + collection bids | ✅ LIVE |
+| `v2-dev` | **V2 (Development)** — V1 features + auctions, private bids, private sales, sealed bids | 🚧 In Progress |
+
+**V1 is production.** Bug fixes go to `main` first, then get merged into `v2-dev`.
+
+### Merge Policy
+
+V1 bug fixes are merged into V2 by the core team, but **only if V2 devs have checked their work into `v2-dev`**. At each stable V2 update:
+1. V2 devs push to `v2-dev`
+2. Core team merges latest `main` (V1 fixes) into `v2-dev`
+3. V2 devs resolve any conflicts
+
+If `v2-dev` is stale (not checked in), we can't merge for you.
+
 ## Contract Summary
+
+### V1 (Production — `main` branch)
 
 | Contract | Address | Status |
 |----------|---------|--------|
-| **PentagonMarketplaceV2 (V2.1)** | `0xecC0ba6e383EE0C2Af89dF54cdC6Db743421a76A` | ✅ LIVE |
-| PentagonMarketplaceV2 (V2) | `0xCF4582883e73c5bd00F6F11A8929428ACAEDb7aF` | ❌ DEPRECATED |
-| PentagonMarketplaceV1 | `0x704C82eB1f2a6f700743Eaa7c5c7678263B80500` | ❌ DEPRECATED |
+| **PentagonMarketplace V1** | `0xecC0ba6e383EE0C2Af89dF54cdC6Db743421a76A` | ✅ LIVE |
+
+Internal build history (same contract, iterative deploys):
+
+| Internal Build | Address | Notes |
+|----------------|---------|-------|
+| Initial deploy | `0x704C82eB1f2a6f700743Eaa7c5c7678263B80500` | Retired, 224 stale bids hidden |
+| Rewrite | `0xCF4582883e73c5bd00F6F11A8929428ACAEDb7aF` | Retired, no funds ever flowed |
+| **Current (audit fixes)** | `0xecC0ba6e383EE0C2Af89dF54cdC6Db743421a76A` | **LIVE** — SafeERC20, underflow protection, moderator role |
 
 **Chain:** Pentagon Chain (3344)
 **RPC:** `https://rpc.pentagon.games`
@@ -16,12 +42,12 @@ NFT Marketplace smart contracts for **Pentagon Chain** (Chain ID: 3344).
 
 ---
 
-## Architecture
+## V1 Architecture (Production)
 
 **1 contract** handles everything: listings, purchases, and collection bids.
 
 ```
-PentagonMarketplaceV2 (Ownable, ReentrancyGuard)
+PentagonMarketplace V1 (Ownable, ReentrancyGuard)
 ├── Listings       — sellers list NFTs at fixed prices, buyers purchase
 ├── Collection Bids — bidders offer on any NFT in a collection, sellers accept
 ├── Fee System     — per-collection basis points, ERC-2981 royalties
@@ -39,7 +65,7 @@ PentagonMarketplaceV2 (Ownable, ReentrancyGuard)
 
 ---
 
-## Flow Diagrams
+## V1 Flow Diagrams
 
 ### Listing Flow (List, Buy, Cancel)
 
@@ -124,7 +150,7 @@ flowchart TD
 
 ---
 
-## Function Reference
+## V1 Function Reference
 
 ### Constants
 
@@ -208,7 +234,7 @@ Returns total ERC-20 approval needed: `(price + fee) * size`.
 
 ---
 
-## Security (V2.1 Audit Fixes)
+## Security (V1 Audit Fixes)
 
 | Fix | Description |
 |-----|-------------|
@@ -242,32 +268,22 @@ forge script script/Deploy.s.sol:DeployMarketplaceV2 \
 
 ---
 
-## Version History
+## V2 Specification (Development Branch — `v2-dev`)
 
-| Version | Date | Changes |
-|---------|------|---------|
-| V1 | 2024 | Initial marketplace. DEPRECATED, 224 stale bids hidden, collections disabled. |
-| V2 | May 2025 | Rewrite with ERC-20 support, collection bids, royalties. No funds ever flowed. |
-| V2.1 | May 2025 | Audit fixes: SafeERC20, underflow protection, consistent fees, moderator role. **LIVE** |
-
----
-
-## Planned: PentagonAuctionHouse Contract
-
-A standalone contract adding three features built around **real auction house mechanics**, not glorified timed listings.
+V2 extends V1 with real auction house mechanics. Not glorified timed listings.
 
 Design philosophy: steal from Christie's and Sotheby's, not OpenSea.
 
-### Contract Architecture (Planned)
+### V2 Architecture
 
 ```mermaid
 flowchart TD
-    subgraph "PentagonMarketplaceV2 (LIVE)"
+    subgraph "V1 (Production — main branch)"
         L[Fixed-Price Listings]
         CB[Collection Bids]
     end
 
-    subgraph "PentagonAuctionHouse (PLANNED)"
+    subgraph "V2 Additions (v2-dev branch)"
         PB[Private Bids — bid on specific NFTs]
         PS[Private Sales — designated buyer, no fee]
         LA[Live Auctions — scheduled, soft-close, bid log]
@@ -275,7 +291,7 @@ flowchart TD
         SB[Sealed Bids — blind bidding for high-value pieces]
     end
 
-    L -.-> |"existing"| FEE[Fee System: per-collection bps]
+    L -.-> |"V1"| FEE[Fee System: per-collection bps]
     CB -.-> FEE
     PB --> FEE
     LA --> FEE
@@ -284,18 +300,18 @@ flowchart TD
     PS -.-> |"NO fee"| FREE[Free Service]
 ```
 
-Both contracts share whitelisted collections and fee config (new contract can read from V2.1 or duplicate admin setup).
+V2 builds on the same contract (extends V1 functions) or deploys as a companion contract sharing whitelisted collections and fee config.
 
 ---
 
-### 1. Private Bids (Token-Specific Bids)
+### V2 Feature 1: Private Bids (Token-Specific Bids)
 
 Anyone can bid on a **specific NFT they don't own**. Not a collection-wide offer, a direct bid on a particular piece.
 
 ```mermaid
 sequenceDiagram
     participant Bidder
-    participant Contract as AuctionHouse
+    participant Contract as V2 Contract
     participant Owner as NFT Owner
 
     Bidder->>Contract: placePrivateBid(collection, tokenId, price, duration, paymentToken)
@@ -328,14 +344,14 @@ sequenceDiagram
 
 ---
 
-### 2. Private Sales (Designated Buyer)
+### V2 Feature 2: Private Sales (Designated Buyer)
 
 Owner picks exactly who can buy. Peer-to-peer, no middleman fee.
 
 ```mermaid
 sequenceDiagram
     participant Owner as NFT Owner
-    participant Contract as AuctionHouse
+    participant Contract as V2 Contract
     participant Buyer as Designated Buyer
 
     Owner->>Contract: createPrivateSale(collection, tokenId, price, buyerAddress, paymentToken)
@@ -361,14 +377,14 @@ sequenceDiagram
 
 ---
 
-### 3. Live Auctions (Scheduled, Soft-Close, Bid Log)
+### V2 Feature 3: Live Auctions (Scheduled, Soft-Close, Bid Log)
 
 Real auction mechanics. Scheduled start time, countdown, and a soft-close window that kills sniping.
 
 ```mermaid
 sequenceDiagram
     participant Owner as NFT Owner
-    participant Contract as AuctionHouse
+    participant Contract as V2 Contract
     participant B1 as Bidder 1
     participant B2 as Bidder 2
     participant Anyone
@@ -419,14 +435,14 @@ sequenceDiagram
 
 ---
 
-### 4. Reserve Auctions (Hidden Reserve, Revealed on Hit)
+### V2 Feature 4: Reserve Auctions (Hidden Reserve, Revealed on Hit)
 
 Same mechanics as live auctions, plus a hidden reserve price. Bidders don't know the floor until someone hits it.
 
 ```mermaid
 sequenceDiagram
     participant Owner as NFT Owner
-    participant Contract as AuctionHouse
+    participant Contract as V2 Contract
     participant B1 as Bidder 1
     participant B2 as Bidder 2
 
@@ -464,14 +480,14 @@ sequenceDiagram
 
 ---
 
-### 5. Sealed Bids (Blind Auction for High-Value Pieces)
+### V2 Feature 5: Sealed Bids (Blind Auction for High-Value Pieces)
 
 Commit-reveal pattern. Nobody sees anyone else's bid until the reveal phase.
 
 ```mermaid
 sequenceDiagram
     participant Owner as NFT Owner
-    participant Contract as AuctionHouse
+    participant Contract as V2 Contract
     participant B1 as Bidder 1
     participant B2 as Bidder 2
 
