@@ -121,9 +121,11 @@ contract AuctionHouseTest is Test {
         vm.warp(uint256(_endTime(id)) + 1);
         house.settleAuction(id);
 
+        // fee = 2.5% of 2 = 0.05; rebate 40/40 of fee → buyer 0.02, seller 0.02, platform 0.01
         assertEq(nft.ownerOf(TID), bob);
-        assertEq(seller.balance, 1.95 ether);          // 2 - 2.5% fee
-        assertEq(address(house).balance, 0.05 ether);  // fee retained
+        assertEq(seller.balance, 1.97 ether);          // 2 - 0.05 fee + 0.02 seller rebate
+        assertEq(bob.balance, 98.02 ether);            // paid 2 (→98), +0.02 winner rebate
+        assertEq(address(house).balance, 0.01 ether);  // platform keeps 20% of fee
     }
 
     function testNoBidReturnsNftToSeller() public {
@@ -163,8 +165,9 @@ contract AuctionHouseTest is Test {
         vm.warp(uint256(_endTime(id)) + 1);
         house.settleAuction(id);
         assertEq(nft.ownerOf(2), bob);
-        assertEq(wpc.balanceOf(seller), 1.95 ether);
-        assertEq(wpc.balanceOf(address(house)), 0.05 ether);
+        assertEq(wpc.balanceOf(seller), 1.97 ether);        // minus fee + seller rebate
+        assertEq(wpc.balanceOf(bob), 8.02 ether);           // 10 - 2 bid + 0.02 winner rebate
+        assertEq(wpc.balanceOf(address(house)), 0.01 ether); // platform keeps 20% of fee
     }
 
     function testIncreaseBidKeepsPosition() public {

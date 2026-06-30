@@ -57,6 +57,12 @@ contract PentagonAuctionHouse is Ownable, ReentrancyGuard, IERC721Receiver {
     // griefing-safe fallback: if a native outbid refund fails, it is credited here to pull
     mapping(address => uint256) public pendingReturns;
 
+    // Auction-only rebate: at settlement the collected fee is split — a share rebated to the
+    // winner and to the seller (in the auction's payment token), the platform keeps the rest.
+    // Default 40% / 40% of the fee (platform keeps 20%). Standard buy/sell has NO rebate.
+    uint256 public buyerRebateBps = 4000; // share of FEE (bps of FEE_DENOMINATOR) to winner
+    uint256 public sellerRebateBps = 4000; // share of FEE to seller
+
     // ─── Events ─────────────────────────────────────────────────
     event AuctionCreated(uint256 indexed auctionId, address indexed collection, uint256 indexed tokenId, address seller, uint256 startPrice, uint64 startTime, uint64 endTime, address paymentToken);
     event BidPlaced(uint256 indexed auctionId, address indexed bidder, uint256 amount, uint256 timestamp);
@@ -64,6 +70,8 @@ contract PentagonAuctionHouse is Ownable, ReentrancyGuard, IERC721Receiver {
     event AuctionExtended(uint256 indexed auctionId, uint64 newEndTime);
     event AuctionSettled(uint256 indexed auctionId, address indexed winner, uint256 amount);
     event AuctionCancelled(uint256 indexed auctionId);
+    event RebatePaid(uint256 indexed auctionId, address indexed buyer, uint256 buyerReward, address seller, uint256 sellerReward);
+    event RebateUpdated(uint256 buyerRebateBps, uint256 sellerRebateBps);
     event CollectionWhitelisted(address indexed collection, bool status);
     event MarketplaceFeeUpdated(address indexed collection, uint256 fee);
     event FundsWithdrawn(address indexed admin, address indexed token, uint256 amount);
@@ -201,14 +209,20 @@ contract PentagonAuctionHouse is Ownable, ReentrancyGuard, IERC721Receiver {
         } catch {}
 
         require(fee + royaltyAmount <= price, "Fee + royalty exceeds price");
-        uint256 sellerProceeds = price - fee - royaltyAmount;
 
-        // NFT to winner; funds out; fee retained in contract for owner withdrawal.
+        // Auction-only rebate: split the fee back to winner + seller; platform keeps remainder.
+        uint256 buyerReward = (fee * buyerRebateBps) / FEE_DENOMINATOR;
+        uint256 sellerReward = (fee * sellerRebateBps) / FEE_DENOMINATOR;
+        uint256 sellerProceeds = price - fee - royaltyAmount + sellerReward;
+
+        // NFT to winner; funds out; platform keeps fee - buyerReward - sellerReward.
         IERC721(a.collection).safeTransferFrom(address(this), a.highestBidder, a.tokenId);
         _payout(a.paymentToken, a.seller, sellerProceeds);
         if (royaltyAmount > 0) _payout(a.paymentToken, royaltyReceiver, royaltyAmount);
+        if (buyerReward > 0) _payout(a.paymentToken, a.highestBidder, buyerReward);
 
         emit AuctionSettled(auctionId, a.highestBidder, price);
+        emit RebatePaid(auctionId, a.highestBidder, buyerReward, a.seller, sellerReward);
     }
 
     // ─── Cancel ─────────────────────────────────────────────────
@@ -255,6 +269,13 @@ contract PentagonAuctionHouse is Ownable, ReentrancyGuard, IERC721Receiver {
         require(fee <= 1000, "Fee too high (max 10%)");
         marketplaceFees[collection] = fee;
         emit MarketplaceFeeUpdated(collection, fee);
+    }
+
+    function setRebate(uint256 _buyerRebateBps, uint256 _sellerRebateBps) external onlyOwner {
+        require(_buyerRebateBps + _sellerRebateBps <= FEE_DENOMINATOR, "Rebate exceeds fee");
+        buyerRebateBps = _buyerRebateBps;
+        sellerRebateBps = _sellerRebateBps;
+        emit RebateUpdated(_buyerRebateBps, _sellerRebateBps);
     }
 
     function withdrawFunds(address token, uint256 amount) external onlyOwner {
