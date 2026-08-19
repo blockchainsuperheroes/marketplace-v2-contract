@@ -10,7 +10,7 @@ import {PentagonNFTOffers} from "../src/NFTOffers.sol";
 contract DeployNFTOffers is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
-        address newOwner = vm.envOr("OWNER", address(0x2e3e82a95f5c4c47E30A5b420Ac4f99d32EF61f)); // hardware wallet placeholder — overridden by env
+        address newOwner = vm.envOr("OWNER", address(0xB2e3e82a95f5c4c47E30A5b420Ac4f99d32EF61f)); // hardware wallet placeholder — overridden by env
         vm.startBroadcast(deployerKey);
         PentagonNFTOffers offers = new PentagonNFTOffers();
         if (newOwner != address(0) && newOwner != msg.sender) {
