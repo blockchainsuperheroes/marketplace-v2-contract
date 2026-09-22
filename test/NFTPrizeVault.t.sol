@@ -12,6 +12,29 @@ contract MockNFT is ERC721 {
     function mint(address to, uint256 id) external { _mint(to, id); }
 }
 
+// Winner that refuses delivery — release must fail safe (drop stays alive, owner can invalidate).
+contract RejectingWinner {
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        revert("no thanks");
+    }
+}
+
+// Winner that re-enters release() from the receive hook with the same attestation.
+contract ReentrantWinner {
+    NFTPrizeVault public vault;
+    bytes public payload;
+    bool public reentered;
+    bool public reentryReverted;
+    constructor(NFTPrizeVault v) { vault = v; }
+    function arm(bytes calldata p) external { payload = p; }
+    function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
+        reentered = true;
+        (bool ok, ) = address(vault).call(payload);
+        reentryReverted = !ok;
+        return this.onERC721Received.selector;
+    }
+}
+
 contract NFTPrizeVaultTest is Test {
     NFTPrizeVault vault;
     MockNFT nft;
@@ -167,6 +190,66 @@ contract NFTPrizeVaultTest is Test {
         vm.prank(owner);
         vm.expectRevert(); // ECDSA.recover reverts on bad length — never address(0)
         vault.release(DROP, winner, settleTx, deadline, hex"deadbeef", hex"deadbeef");
+    }
+
+    function test_release_sameSigForBothParamsFails() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        (bytes memory k, bytes memory v) = _attest(winner, deadline);
+        vm.prank(owner);
+        vm.expectRevert(NFTPrizeVault.BadVerifierSig.selector);
+        vault.release(DROP, winner, settleTx, deadline, k, k);
+        vm.prank(owner);
+        vm.expectRevert(NFTPrizeVault.BadKeeperSig.selector);
+        vault.release(DROP, winner, settleTx, deadline, v, v);
+    }
+
+    function test_release_crossDropReplayFails() public {
+        // Second prize in the same vault; attestation for DROP must not release DROP2.
+        uint256 DROP2 = DROP + 1;
+        uint256 TOKEN2 = 9999;
+        nft.mint(owner, TOKEN2);
+        vm.prank(owner);
+        vault.deposit(DROP2, address(nft), TOKEN2);
+        uint256 deadline = block.timestamp + 1 hours;
+        (bytes memory k, bytes memory v) = _attest(winner, deadline); // signed for DROP
+        vm.prank(owner);
+        vm.expectRevert(NFTPrizeVault.BadKeeperSig.selector);
+        vault.release(DROP2, winner, settleTx, deadline, k, v);
+        assertEq(nft.ownerOf(TOKEN2), address(vault));
+        // and a sig for DROP2 over DROP's token/collection is likewise rejected on DROP2
+        bytes32 wrong = vault.releaseDigest(DROP2, address(nft), TOKEN, winner, settleTx, deadline);
+        vm.prank(owner);
+        vm.expectRevert(NFTPrizeVault.BadKeeperSig.selector);
+        vault.release(DROP2, winner, settleTx, deadline, _sign(KEEPER_PK, wrong), _sign(VERIFIER_PK, wrong));
+    }
+
+    // ─── contract winners (v1 is EOA-only by UI, contract must still be safe) ──
+    function test_release_rejectingContractWinner_failsSafe() public {
+        address rw = address(new RejectingWinner());
+        uint256 deadline = block.timestamp + 1 hours;
+        (bytes memory k, bytes memory v) = _attest(rw, deadline);
+        vm.prank(owner);
+        vm.expectRevert(bytes("no thanks"));
+        vault.release(DROP, rw, settleTx, deadline, k, v);
+        // drop still alive and held → owner can invalidate + refund PC-side
+        assertEq(nft.ownerOf(TOKEN), address(vault));
+        assertTrue(vault.isReleasable(DROP));
+        vm.prank(owner);
+        vault.invalidate(DROP);
+        assertEq(nft.ownerOf(TOKEN), owner);
+    }
+
+    function test_release_reenteringContractWinner_reentryReverts() public {
+        ReentrantWinner rw = new ReentrantWinner(vault);
+        uint256 deadline = block.timestamp + 1 hours;
+        (bytes memory k, bytes memory v) = _attest(address(rw), deadline);
+        rw.arm(abi.encodeCall(vault.release, (DROP, address(rw), settleTx, deadline, k, v)));
+        _release(address(rw), deadline, k, v);
+        assertTrue(rw.reentered());
+        assertTrue(rw.reentryReverted()); // Ownable + nonReentrant + released=true — all three block it
+        assertEq(nft.ownerOf(TOKEN), address(rw));
+        (,,, bool rel,) = vault.prizes(DROP);
+        assertTrue(rel);
     }
 
     // ─── deadline ───────────────────────────────────────────────
