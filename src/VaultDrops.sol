@@ -181,6 +181,22 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         emit BidReclaimed(dropId, msg.sender, amount);
     }
 
+    // ─── Escape hatch: wrong markFulfilled ──────────────────────
+    /// @notice markFulfilled burns/pays out the bid immediately and permanently blocks reclaimBid,
+    ///         so a mistaken mark (NFT never actually delivered) would leave the winner with neither.
+    ///         The owner makes the winner whole by re-funding the exact bid from treasury. The
+    ///         `fulfilled` flag is deliberately NOT reversible — the payout already happened.
+    function ownerRefund(uint256 dropId) external payable onlyOwner nonReentrant {
+        Drop storage d = drops[dropId];
+        require(d.fulfilled, "Not fulfilled");
+        require(!d.reclaimed, "Already reclaimed");
+        require(msg.value == d.highestBid, "Must fund exact bid");
+        d.reclaimed = true;
+        (bool ok, ) = payable(d.highestBidder).call{value: msg.value}("");
+        require(ok, "Refund failed");
+        emit BidReclaimed(dropId, d.highestBidder, msg.value);
+    }
+
     // ─── Cancel (owner, only while no bids) ─────────────────────
     function cancelDrop(uint256 dropId) external onlyOwner {
         Drop storage d = drops[dropId];

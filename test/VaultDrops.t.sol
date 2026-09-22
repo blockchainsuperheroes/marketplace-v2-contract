@@ -114,6 +114,27 @@ contract VaultDropsTest is Test {
         vd.reclaimBid(id);
     }
 
+    function testOwnerRefundAfterWrongFulfill() public {
+        uint256 id = _create();
+        vm.prank(bob);
+        vd.bid{value: 2 ether}(id);
+        vm.warp(uint256(_endTime(id)) + 1);
+        vd.settleDrop(id);
+        vd.markFulfilled(id, bytes32(uint256(1))); // mistaken mark — NFT never delivered
+        uint256 before = bob.balance;
+        vm.deal(address(this), 10 ether);
+        vm.expectRevert(bytes("Must fund exact bid"));
+        vd.ownerRefund{value: 1 ether}(id);
+        vd.ownerRefund{value: 2 ether}(id);
+        assertEq(bob.balance, before + 2 ether);
+        vm.expectRevert(bytes("Already reclaimed"));
+        vd.ownerRefund{value: 2 ether}(id);
+        // not callable before a mark — reclaimBid is the normal path there
+        uint256 id2 = _create();
+        vm.expectRevert(bytes("Not fulfilled"));
+        vd.ownerRefund{value: 0}(id2);
+    }
+
     function testCancelOnlyWithoutBids() public {
         uint256 id = _create();
         vd.cancelDrop(id); // ok, no bids

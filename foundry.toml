@@ -5,7 +5,11 @@ libs = ["lib"]
 via_ir = true
 optimizer = true
 optimizer_runs = 200
-solc = "0.8.20"
+# OZ 5.6 (EIP712/ERC721/Bytes) needs ^0.8.24 + cancun (MCOPY). NFTPrizeVault targets Ethereum
+# mainnet, where that is fine. Pentagon-bound bytecode (deploy-vaultdrops.html, deploy-contracts.html)
+# was built under 0.8.20/shanghai — rebuild those with `--use 0.8.20 --evm-version shanghai`.
+solc = "0.8.24"
+evm_version = "cancun"
 
 [rpc_endpoints]
 pentagon = "https://rpc.pentagon.games/rpc/GLuLMOVEM0ANn4Wj6oVgSqcbEeshwSDj9"
