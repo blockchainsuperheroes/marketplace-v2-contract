@@ -29,6 +29,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         uint64 startTime;
         uint64 endTime;
         uint256 startPrice;
+        uint256 redeemPrice; // 0 = auction only; >0 = "redeem now": first to pay this wins instantly
         uint256 highestBid;
         address highestBidder;
         uint64 settledAt; // 0 = not settled
@@ -52,7 +53,8 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     address public treasury; // remainder
     uint64 public fulfillWindow = 7 days; // reclaim failsafe after this
 
-    event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime);
+    event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
+    event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
     event BidPlaced(uint256 indexed dropId, address indexed bidder, uint256 amount, uint256 timestamp);
     event BidIncreased(uint256 indexed dropId, address indexed bidder, uint256 newAmount);
     event DropExtended(uint256 indexed dropId, uint64 newEndTime);
@@ -74,10 +76,12 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         uint256 prizeTokenId,
         uint256 startPrice,
         uint64 duration,
-        uint64 startTime
+        uint64 startTime,
+        uint256 redeemPrice
     ) external onlyOwner returns (uint256 dropId) {
         require(startPrice >= MIN_INCREMENT, "Start price too low");
         require(duration > 0 && duration <= MAX_DURATION, "Bad duration");
+        require(redeemPrice == 0 || redeemPrice >= startPrice, "Redeem below start");
         uint64 start = startTime == 0 ? uint64(block.timestamp) : startTime;
         require(start >= block.timestamp, "Start in past");
 
@@ -89,13 +93,38 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
             startTime: start,
             endTime: start + duration,
             startPrice: startPrice,
+            redeemPrice: redeemPrice,
             highestBid: 0,
             highestBidder: address(0),
             settledAt: 0,
             fulfilled: false,
             reclaimed: false
         });
-        emit DropCreated(dropId, prizeChainId, prizeContract, prizeTokenId, startPrice, start, start + duration);
+        emit DropCreated(dropId, prizeChainId, prizeContract, prizeTokenId, startPrice, start, start + duration, redeemPrice);
+    }
+
+    // ─── Redeem now (fixed price, first come first served) ─────
+    /// @notice Straight redemption: pay `redeemPrice` and the drop settles to you instantly.
+    ///         Any standing highest bidder is refunded. Same escrow/fulfill/reclaim path after.
+    function redeem(uint256 dropId) external payable nonReentrant {
+        Drop storage d = drops[dropId];
+        require(d.endTime != 0, "No drop");
+        require(d.redeemPrice != 0, "Not redeemable");
+        require(d.settledAt == 0, "Settled");
+        require(block.timestamp >= d.startTime, "Not started");
+        require(block.timestamp < d.endTime, "Ended");
+        require(msg.value == d.redeemPrice, "Pay exact redeem price");
+
+        address prev = d.highestBidder;
+        uint256 prevBid = d.highestBid;
+        d.highestBid = msg.value;
+        d.highestBidder = msg.sender;
+        d.endTime = uint64(block.timestamp);
+        d.settledAt = uint64(block.timestamp);
+
+        if (prev != address(0)) _refund(prev, prevBid);
+        emit DropRedeemed(dropId, msg.sender, msg.value);
+        emit DropSettled(dropId, msg.sender, msg.value);
     }
 
     // ─── Bid (native PC) ────────────────────────────────────────
@@ -108,6 +137,8 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
 
         uint256 minBid = d.highestBid == 0 ? d.startPrice : d.highestBid + MIN_INCREMENT;
         require(msg.value >= minBid, "Bid too low");
+        // Don't let a bidder overpay past the instant price — redeem() is the right call there.
+        require(d.redeemPrice == 0 || msg.value < d.redeemPrice, "Use redeem");
 
         address prev = d.highestBidder;
         uint256 prevBid = d.highestBid;

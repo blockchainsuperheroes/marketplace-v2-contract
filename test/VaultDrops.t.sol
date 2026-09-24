@@ -24,17 +24,17 @@ contract VaultDropsTest is Test {
     }
 
     function _create() internal returns (uint256 id) {
-        id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 42, 1 ether, 1 days, 0);
+        id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 42, 1 ether, 1 days, 0, 0);
     }
 
     function _endTime(uint256 id) internal view returns (uint64 endTime) {
-        (, , , , endTime, , , , , , ) = vd.drops(id);
+        (, , , , endTime, , , , , , , ) = vd.drops(id);
     }
 
     function testOnlyOwnerCreates() public {
         vm.prank(alice);
         vm.expectRevert();
-        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 42, 1 ether, 1 days, 0);
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 42, 1 ether, 1 days, 0, 0);
     }
 
     function testBidOutbidRefund() public {
@@ -162,5 +162,48 @@ contract VaultDropsTest is Test {
         vm.prank(alice);
         vm.expectRevert();
         vd.setConfig(5000, treasury, 7 days);
+    }
+
+    function _createRedeemable() internal returns (uint256 id) {
+        id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 43, 1 ether, 1 days, 0, 5 ether);
+    }
+
+    function testRedeemSettlesInstantlyAndRefundsBidder() public {
+        uint256 id = _createRedeemable();
+        vm.prank(alice);
+        vd.bid{value: 2 ether}(id);
+        uint256 aliceBefore = alice.balance;
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        assertEq(alice.balance, aliceBefore + 2 ether, "outbid bidder refunded");
+        (, , , , uint64 endTime, , , uint256 hb, address hbr, uint64 settledAt, , ) = vd.drops(id);
+        assertEq(hbr, bob);
+        assertEq(hb, 5 ether);
+        assertTrue(settledAt != 0 && endTime == settledAt, "settled now");
+        // normal escrow path continues: fulfill splits burn/treasury
+        vd.markFulfilled(id, bytes32(uint256(9)));
+        // no second redeem / bid after settle
+        vm.prank(alice);
+        vm.expectRevert(bytes("Settled"));
+        vd.redeem{value: 5 ether}(id);
+    }
+
+    function testRedeemGuards() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vm.expectRevert(bytes("Pay exact redeem price"));
+        vd.redeem{value: 4 ether}(id);
+        // bids at/above redeem price are pushed to redeem()
+        vm.prank(bob);
+        vm.expectRevert(bytes("Use redeem"));
+        vd.bid{value: 5 ether}(id);
+        // auction-only drop can't be redeemed
+        uint256 id2 = _create();
+        vm.prank(bob);
+        vm.expectRevert(bytes("Not redeemable"));
+        vd.redeem{value: 1 ether}(id2);
+        // redeem below start price rejected at create
+        vm.expectRevert(bytes("Redeem below start"));
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 44, 1 ether, 1 days, 0, 0.5 ether);
     }
 }
