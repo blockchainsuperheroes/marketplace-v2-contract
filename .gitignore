@@ -1,0 +1,4 @@
+# forge simulations and per-run "sensitive values" of the Points Store deploys — never commit
+**/dry-run/
+cache/DeployVaultDrops.s.sol/
+cache/DeployPrizeLocker.s.sol/
