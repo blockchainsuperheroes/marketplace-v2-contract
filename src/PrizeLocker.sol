@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
@@ -58,6 +59,8 @@ contract PentagonPrizeLocker is EIP712, IERC721Receiver, ReentrancyGuard {
     uint256 public constant MAX_DEADLINE = 48 hours;
     /// Every role change sits in public view this long before it can take effect.
     uint256 public constant ROLE_DELAY = 48 hours;
+    /// A proposal not executed within this long after its delay expires is dead (no stale keys).
+    uint256 public constant ROLE_GRACE = 7 days;
 
     address public admin; // Pentagon admin: signs every transfer out (never needs gas here)
     address public keeper; // submits releases
@@ -98,6 +101,8 @@ contract PentagonPrizeLocker is EIP712, IERC721Receiver, ReentrancyGuard {
     error TooEarly();
     error UnexpectedTransfer();
     error NotHeld();
+    error NotERC721();
+    error ProposalExpired();
 
     constructor(address admin_, address keeper_, address depositor_) EIP712("PentagonPrizeLocker", "1") {
         _setRoles(admin_, keeper_, depositor_);
@@ -110,6 +115,13 @@ contract PentagonPrizeLocker is EIP712, IERC721Receiver, ReentrancyGuard {
         if (msg.sender != depositor) revert NotDepositor();
         if (collection == address(0)) revert ZeroAddress();
         if (lockOf[collection][tokenId] != 0) revert AlreadyLocked();
+        // Only standard ERC-721s: release/withdraw move tokens with safeTransferFrom, so a legacy
+        // token (no ERC-721 interface) adopted here could never leave.
+        try IERC165(collection).supportsInterface(0x80ac58cd) returns (bool ok) {
+            if (!ok) revert NotERC721();
+        } catch {
+            revert NotERC721();
+        }
         lockId = ++lockCount;
         locks[lockId] = Lock({collection: collection, tokenId: tokenId, depositor: msg.sender, status: Status.Locked});
         lockOf[collection][tokenId] = lockId;
@@ -135,8 +147,9 @@ contract PentagonPrizeLocker is EIP712, IERC721Receiver, ReentrancyGuard {
         _requireAdmin(releaseDigest(lockId, to, deadline), adminSig);
         l.status = Status.Released;
         lockOf[l.collection][l.tokenId] = 0;
+        // safeTransferFrom already guarantees delivery (recipient contracts must accept it); no
+        // ownerOf re-check, so wallets that forward the NFT on arrival still work.
         IERC721(l.collection).safeTransferFrom(address(this), to, l.tokenId);
-        if (IERC721(l.collection).ownerOf(l.tokenId) != to) revert NotHeld();
         emit Released(lockId, l.collection, l.tokenId, to);
     }
 
@@ -170,6 +183,7 @@ contract PentagonPrizeLocker is EIP712, IERC721Receiver, ReentrancyGuard {
         PendingRoles memory p = pending;
         if (p.eta == 0) revert NothingPending();
         if (block.timestamp < p.eta) revert TooEarly();
+        if (block.timestamp > uint256(p.eta) + ROLE_GRACE) revert ProposalExpired();
         if (p.admin != admin) {
             if (!SignatureChecker.isValidSignatureNow(p.admin, acceptAdminDigest(p.admin), newAdminSig)) revert BadNewAdminSig();
         }

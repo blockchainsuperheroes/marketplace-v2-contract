@@ -44,6 +44,12 @@ contract AdminDrainer {
     }
 }
 
+
+// Pre-ERC721 style token (no ERC-165): must be refused at check-in, else it could never leave.
+contract LegacyToken {
+    function ownerOf(uint256) external view returns (address) { return msg.sender; }
+}
+
 contract PrizeLockerTest is Test {
     PentagonPrizeLocker locker;
     MockAzuki nft;
@@ -359,5 +365,19 @@ contract PrizeLockerTest is Test {
         vm.prank(keeper);
         vm.expectRevert(PentagonPrizeLocker.BadAdminSig.selector);
         locker.release(1, winner, dl, sig);
+    }
+
+    function test_roles_proposalExpiresAfterGrace() public {
+        _propose(admin, makeAddr("k4"), depositor);
+        vm.warp(block.timestamp + 48 hours + 7 days + 1);
+        vm.expectRevert(PentagonPrizeLocker.ProposalExpired.selector);
+        locker.executeRoles("");
+    }
+
+    function test_checkIn_rejectsNonERC721() public {
+        LegacyToken t = new LegacyToken();
+        vm.prank(depositor);
+        vm.expectRevert(PentagonPrizeLocker.NotERC721.selector);
+        locker.checkIn(address(t), 1);
     }
 }
