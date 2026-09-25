@@ -17,8 +17,8 @@ contract VaultDropsTest is Test {
     address constant PRIZE_CONTRACT = 0x67abaDDb1258077F7900abD8AdE0EcC6CdC38ac2;
 
     function setUp() public {
-        vd = new PentagonVaultDrops(); // owner = this; treasury defaults to owner
-        vd.setConfig(5000, treasury, 7 days);
+        vd = new PentagonVaultDrops(); // owner = this
+        vd.setConfig(7 days);
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
     }
@@ -65,20 +65,50 @@ contract VaultDropsTest is Test {
         vd.settleDrop(id);
         // funds still escrowed — nothing paid out at settlement
         assertEq(address(vd).balance, 2 ether);
-        assertEq(treasury.balance, 0);
+        assertEq(vd.proceeds(), 0);
         assertEq(BURN.balance, 0);
     }
 
-    function testFulfillSplitsBurnTreasury() public {
+    function testFulfillRetainsProceedsNoBurn() public {
         uint256 id = _create();
         vm.prank(bob);
         vd.bid{value: 2 ether}(id);
         vm.warp(uint256(_endTime(id)) + 1);
         vd.settleDrop(id);
         vd.markFulfilled(id, bytes32(uint256(0xbeef)));
-        assertEq(BURN.balance, 1 ether); // 50% burned — the PC sink
-        assertEq(treasury.balance, 1 ether); // 50% treasury
-        assertEq(address(vd).balance, 0);
+        assertEq(BURN.balance, 0, "nothing burned");
+        assertEq(address(vd).balance, 2 ether, "stays in the contract");
+        assertEq(vd.proceeds(), 2 ether, "owner-withdrawable");
+        // owner may withdraw later, only up to proceeds
+        vm.expectRevert(bytes("Bad amount"));
+        vd.withdrawProceeds(treasury, 3 ether);
+        vd.withdrawProceeds(treasury, 2 ether);
+        assertEq(treasury.balance, 2 ether);
+        assertEq(vd.proceeds(), 0);
+    }
+
+    function testProceedsNeverTouchOpenClaims() public {
+        uint256 a = _createRedeemable();
+        uint256 b = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 99, 1 ether, 1 days, 0, 3 ether);
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(a);
+        vm.prank(alice);
+        vd.redeem{value: 3 ether}(b);
+        vd.markFulfilled(a, bytes32(uint256(1)));
+        // 8 PC in the contract, but only the delivered claim (5) is withdrawable
+        assertEq(address(vd).balance, 8 ether);
+        vm.expectRevert(bytes("Bad amount"));
+        vd.withdrawProceeds(treasury, 6 ether);
+        vd.withdrawProceeds(treasury, 5 ether);
+        // alice's open claim is intact and reclaimable in full
+        vm.warp(block.timestamp + 7 days);
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        vd.reclaimBid(b);
+        assertEq(alice.balance, before + 3 ether);
+        vm.prank(address(0xBEEF));
+        vm.expectRevert();
+        vd.withdrawProceeds(address(0xBEEF), 1);
     }
 
     function testReclaimAfterWindowRefundsWinner() public {
@@ -125,14 +155,29 @@ contract VaultDropsTest is Test {
         vm.deal(address(this), 10 ether);
         vm.expectRevert(bytes("Must fund exact bid"));
         vd.ownerRefund{value: 1 ether}(id);
-        vd.ownerRefund{value: 2 ether}(id);
+        vd.ownerRefund(id); // no value → paid from that claim's proceeds
         assertEq(bob.balance, before + 2 ether);
+        assertEq(vd.proceeds(), 0);
         vm.expectRevert(bytes("Already reclaimed"));
-        vd.ownerRefund{value: 2 ether}(id);
+        vd.ownerRefund(id);
         // not callable before a mark — reclaimBid is the normal path there
         uint256 id2 = _create();
         vm.expectRevert(bytes("Not fulfilled"));
         vd.ownerRefund{value: 0}(id2);
+    }
+
+    function testOwnerRefundFundedAfterProceedsWithdrawn() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vd.markFulfilled(id, bytes32(uint256(1)));
+        vd.withdrawProceeds(treasury, 5 ether);
+        vm.expectRevert(bytes("Insufficient proceeds"));
+        vd.ownerRefund(id);
+        vm.deal(address(this), 5 ether);
+        uint256 before = bob.balance;
+        vd.ownerRefund{value: 5 ether}(id);
+        assertEq(bob.balance, before + 5 ether);
     }
 
     function testCancelOnlyWithoutBids() public {
@@ -155,13 +200,11 @@ contract VaultDropsTest is Test {
     }
 
     function testConfigGuards() public {
-        vm.expectRevert(bytes("burnBps > 100%"));
-        vd.setConfig(10001, treasury, 7 days);
         vm.expectRevert(bytes("Bad window"));
-        vd.setConfig(5000, treasury, 12 hours);
+        vd.setConfig(12 hours);
         vm.prank(alice);
         vm.expectRevert();
-        vd.setConfig(5000, treasury, 7 days);
+        vd.setConfig(7 days);
     }
 
     function _createRedeemable() internal returns (uint256 id) {
@@ -177,7 +220,7 @@ contract VaultDropsTest is Test {
         assertEq(hbr, bob);
         assertEq(hb, 5 ether);
         assertTrue(settledAt != 0 && endTime == settledAt, "settled now");
-        // normal escrow path continues: fulfill splits burn/treasury
+        // normal escrow path continues: fulfill moves it to owner proceeds
         vd.markFulfilled(id, bytes32(uint256(9)));
         // no second redeem / bid after settle
         vm.prank(alice);
@@ -209,7 +252,7 @@ contract VaultDropsTest is Test {
 
     // Settlement-ledger events: payment.pentagon.games indexes Claimed / Delivered / Reclaimed.
     event Claimed(uint256 indexed dropId, address indexed claimer, uint256 amount, bytes32 ref);
-    event Delivered(uint256 indexed dropId, uint256 burned, uint256 toTreasury);
+    event Delivered(uint256 indexed dropId, uint256 amount);
     event Reclaimed(uint256 indexed dropId, address indexed claimer, uint256 amount);
 
     function testLedgerEventsClaimDeliver() public {
@@ -219,7 +262,7 @@ contract VaultDropsTest is Test {
         vm.prank(bob);
         vd.redeem{value: 5 ether}(id);
         vm.expectEmit(true, false, false, true);
-        emit Delivered(id, 2.5 ether, 2.5 ether);
+        emit Delivered(id, 5 ether);
         vd.markFulfilled(id, bytes32(uint256(7)));
     }
 

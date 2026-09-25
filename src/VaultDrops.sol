@@ -10,12 +10,14 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *         users bid earned PC; the prize is an NFT the project treasury holds on ANOTHER chain
  *         (e.g. Ethereum). Bonvoy-points model: the auction is fully trustless on this chain;
  *         prize delivery is a first-party fulfillment with an on-chain receipt + refund failsafe.
+ *         Points Store (2026-09-25): claims are Points-only (fixed redeemPrice, no bidding) and
+ *         delivered-claim PC stays in the contract as owner-withdrawable proceeds (no burn).
  *
  * @dev Reuses the tested PentagonAuctionHouse bid core (native-PC escrow, min increment,
  *      instant griefing-safe outbid refunds, 10-min soft-close). Deliberately holds NO NFTs —
- *      the prize is a reference. Key safety ordering: the winning bid stays ESCROWED at
- *      settlement and is only split burn/treasury on markFulfilled(); if the project fails to
- *      deliver within fulfillWindow, the winner reclaims a full refund.
+ *      the prize is a reference. Key safety ordering: the claim stays ESCROWED at settlement and
+ *      only becomes owner proceeds on markFulfilled(); if the project fails to deliver within
+ *      fulfillWindow, the claimer reclaims the full amount.
  *
  *      ⚠ UNAUDITED. forge test + audit before deployment. Holds bidder funds.
  */
@@ -41,17 +43,16 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     uint64 public constant SOFT_CLOSE_WINDOW = 10 minutes;
     uint64 public constant SOFT_CLOSE_EXTENSION = 10 minutes;
     uint64 public constant MAX_DURATION = 30 days;
-    uint256 public constant BPS = 10000;
-    address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     uint256 public dropCounter;
     mapping(uint256 => Drop) public drops;
     mapping(address => uint256) public pendingReturns; // griefing-safe native refund fallback
 
-    // Winning-bid split, applied on fulfillment (owner-tunable).
-    uint256 public burnBps = 5000; // 50% burned — the PC sink
-    address public treasury; // remainder
     uint64 public fulfillWindow = 7 days; // reclaim failsafe after this
+    // PC from DELIVERED claims (nftprof 2026-09-25: no burn, no auto-transfer — it stays in the
+    // contract and the owner may withdraw it later). Open claims are never part of this: a claim's
+    // PC moves here only when its NFT is delivered, so withdrawals can't touch anyone's escrow.
+    uint256 public proceeds;
 
     event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
     event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
@@ -59,21 +60,20 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     // claim, keyed by an idempotency ref, with its delivery or reversal. PC always moves from/to the
     // claimer's OWN wallet (custodial AA spend rail) — never pooled across users.
     event Claimed(uint256 indexed dropId, address indexed claimer, uint256 amount, bytes32 ref);
-    event Delivered(uint256 indexed dropId, uint256 burned, uint256 toTreasury);
+    event Delivered(uint256 indexed dropId, uint256 amount);
     event Reclaimed(uint256 indexed dropId, address indexed claimer, uint256 amount);
     event BidPlaced(uint256 indexed dropId, address indexed bidder, uint256 amount, uint256 timestamp);
     event BidIncreased(uint256 indexed dropId, address indexed bidder, uint256 newAmount);
     event DropExtended(uint256 indexed dropId, uint64 newEndTime);
     event DropSettled(uint256 indexed dropId, address indexed winner, uint256 amount);
-    event DropFulfilled(uint256 indexed dropId, address indexed winner, bytes32 prizeTxHash, uint256 burned, uint256 toTreasury);
+    event DropFulfilled(uint256 indexed dropId, address indexed winner, bytes32 prizeTxHash, uint256 amount);
     event BidReclaimed(uint256 indexed dropId, address indexed winner, uint256 amount);
     event DropCancelled(uint256 indexed dropId);
-    event ConfigUpdated(uint256 burnBps, address treasury, uint64 fulfillWindow);
+    event ConfigUpdated(uint64 fulfillWindow);
+    event ProceedsWithdrawn(address indexed to, uint256 amount);
     event PendingReturnWithdrawn(address indexed account, uint256 amount);
 
-    constructor() Ownable(msg.sender) {
-        treasury = msg.sender;
-    }
+    constructor() Ownable(msg.sender) {}
 
     // ─── Create (project-only) ──────────────────────────────────
     function createDrop(
@@ -183,7 +183,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
 
     // ─── Fulfill (project delivers prize on the other chain) ───
     /// @notice After delivering the prize NFT to the winner on the prize chain, the owner posts
-    ///         the delivery tx hash. Only then is the winning bid split burn/treasury.
+    ///         the delivery tx hash. Only then does the claim's PC become owner proceeds.
     function markFulfilled(uint256 dropId, bytes32 prizeTxHash) external onlyOwner nonReentrant {
         Drop storage d = drops[dropId];
         require(d.settledAt != 0, "Not settled");
@@ -193,18 +193,9 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         d.fulfilled = true;
 
         uint256 amount = d.highestBid;
-        uint256 burned = (amount * burnBps) / BPS;
-        uint256 toTreasury = amount - burned;
-        if (burned > 0) {
-            (bool okB, ) = payable(BURN_ADDRESS).call{value: burned}("");
-            require(okB, "Burn failed");
-        }
-        if (toTreasury > 0) {
-            (bool okT, ) = payable(treasury).call{value: toTreasury}("");
-            require(okT, "Treasury transfer failed");
-        }
-        emit DropFulfilled(dropId, d.highestBidder, prizeTxHash, burned, toTreasury);
-        emit Delivered(dropId, burned, toTreasury);
+        proceeds += amount; // stays in the contract; owner may withdraw later
+        emit DropFulfilled(dropId, d.highestBidder, prizeTxHash, amount);
+        emit Delivered(dropId, amount);
     }
 
     // ─── Failsafe: full refund if the project doesn't deliver ──
@@ -224,20 +215,36 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     }
 
     // ─── Escape hatch: wrong markFulfilled ──────────────────────
-    /// @notice markFulfilled burns/pays out the bid immediately and permanently blocks reclaimBid,
-    ///         so a mistaken mark (NFT never actually delivered) would leave the winner with neither.
-    ///         The owner makes the winner whole by re-funding the exact bid from treasury. The
-    ///         `fulfilled` flag is deliberately NOT reversible — the payout already happened.
+    /// @notice markFulfilled permanently blocks reclaimBid, so a mistaken mark (NFT never actually
+    ///         delivered) would leave the claimer with neither. The owner makes the claimer whole with
+    ///         exactly that claim's amount — from proceeds (send no value) or freshly funded (send the
+    ///         exact amount, e.g. if proceeds were already withdrawn). `fulfilled` stays set.
     function ownerRefund(uint256 dropId) external payable onlyOwner nonReentrant {
         Drop storage d = drops[dropId];
         require(d.fulfilled, "Not fulfilled");
         require(!d.reclaimed, "Already reclaimed");
-        require(msg.value == d.highestBid, "Must fund exact bid");
+        uint256 amount = d.highestBid;
+        if (msg.value == 0) {
+            require(proceeds >= amount, "Insufficient proceeds");
+            proceeds -= amount;
+        } else {
+            require(msg.value == amount, "Must fund exact bid");
+        }
         d.reclaimed = true;
-        (bool ok, ) = payable(d.highestBidder).call{value: msg.value}("");
+        (bool ok, ) = payable(d.highestBidder).call{value: amount}("");
         require(ok, "Refund failed");
-        emit BidReclaimed(dropId, d.highestBidder, msg.value);
-        emit Reclaimed(dropId, d.highestBidder, msg.value);
+        emit BidReclaimed(dropId, d.highestBidder, amount);
+        emit Reclaimed(dropId, d.highestBidder, amount);
+    }
+
+    // ─── Owner proceeds (delivered claims only) ─────────────────
+    function withdrawProceeds(address to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Zero address");
+        require(amount > 0 && amount <= proceeds, "Bad amount");
+        proceeds -= amount;
+        (bool ok, ) = payable(to).call{value: amount}("");
+        require(ok, "Withdraw failed");
+        emit ProceedsWithdrawn(to, amount);
     }
 
     // ─── Cancel (owner, only while no bids) ─────────────────────
@@ -250,14 +257,10 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     }
 
     // ─── Config ─────────────────────────────────────────────────
-    function setConfig(uint256 _burnBps, address _treasury, uint64 _fulfillWindow) external onlyOwner {
-        require(_burnBps <= BPS, "burnBps > 100%");
-        require(_treasury != address(0), "Zero treasury");
+    function setConfig(uint64 _fulfillWindow) external onlyOwner {
         require(_fulfillWindow >= 1 days && _fulfillWindow <= 90 days, "Bad window");
-        burnBps = _burnBps;
-        treasury = _treasury;
         fulfillWindow = _fulfillWindow;
-        emit ConfigUpdated(_burnBps, _treasury, _fulfillWindow);
+        emit ConfigUpdated(_fulfillWindow);
     }
 
     // ─── Pull-payment fallback ──────────────────────────────────
