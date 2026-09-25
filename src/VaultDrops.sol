@@ -55,6 +55,12 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
 
     event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
     event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
+    // Settlement-ledger events (payment.pentagon.games event_tracker indexes these): one row per
+    // claim, keyed by an idempotency ref, with its delivery or reversal. PC always moves from/to the
+    // claimer's OWN wallet (custodial AA spend rail) — never pooled across users.
+    event Claimed(uint256 indexed dropId, address indexed claimer, uint256 amount, bytes32 ref);
+    event Delivered(uint256 indexed dropId, uint256 burned, uint256 toTreasury);
+    event Reclaimed(uint256 indexed dropId, address indexed claimer, uint256 amount);
     event BidPlaced(uint256 indexed dropId, address indexed bidder, uint256 amount, uint256 timestamp);
     event BidIncreased(uint256 indexed dropId, address indexed bidder, uint256 newAmount);
     event DropExtended(uint256 indexed dropId, uint64 newEndTime);
@@ -125,6 +131,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         if (prev != address(0)) _refund(prev, prevBid);
         emit DropRedeemed(dropId, msg.sender, msg.value);
         emit DropSettled(dropId, msg.sender, msg.value);
+        emit Claimed(dropId, msg.sender, msg.value, keccak256(abi.encode(dropId, msg.sender)));
     }
 
     // ─── Bid (native PC) ────────────────────────────────────────
@@ -197,6 +204,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
             require(okT, "Treasury transfer failed");
         }
         emit DropFulfilled(dropId, d.highestBidder, prizeTxHash, burned, toTreasury);
+        emit Delivered(dropId, burned, toTreasury);
     }
 
     // ─── Failsafe: full refund if the project doesn't deliver ──
@@ -212,6 +220,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         (bool ok, ) = payable(msg.sender).call{value: amount}("");
         require(ok, "Refund failed");
         emit BidReclaimed(dropId, msg.sender, amount);
+        emit Reclaimed(dropId, msg.sender, amount);
     }
 
     // ─── Escape hatch: wrong markFulfilled ──────────────────────
@@ -228,6 +237,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
         (bool ok, ) = payable(d.highestBidder).call{value: msg.value}("");
         require(ok, "Refund failed");
         emit BidReclaimed(dropId, d.highestBidder, msg.value);
+        emit Reclaimed(dropId, d.highestBidder, msg.value);
     }
 
     // ─── Cancel (owner, only while no bids) ─────────────────────

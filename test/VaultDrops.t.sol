@@ -206,4 +206,37 @@ contract VaultDropsTest is Test {
         vm.expectRevert(bytes("Redeem below start"));
         vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 44, 1 ether, 1 days, 0, 0.5 ether);
     }
+
+    // Settlement-ledger events: payment.pentagon.games indexes Claimed / Delivered / Reclaimed.
+    event Claimed(uint256 indexed dropId, address indexed claimer, uint256 amount, bytes32 ref);
+    event Delivered(uint256 indexed dropId, uint256 burned, uint256 toTreasury);
+    event Reclaimed(uint256 indexed dropId, address indexed claimer, uint256 amount);
+
+    function testLedgerEventsClaimDeliver() public {
+        uint256 id = _createRedeemable();
+        vm.expectEmit(true, true, false, true);
+        emit Claimed(id, bob, 5 ether, keccak256(abi.encode(id, bob)));
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vm.expectEmit(true, false, false, true);
+        emit Delivered(id, 2.5 ether, 2.5 ether);
+        vd.markFulfilled(id, bytes32(uint256(7)));
+    }
+
+    function testLedgerEventsClaimReclaimExactAmountToClaimer() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vm.warp(block.timestamp + 7 days);
+        uint256 before = bob.balance;
+        vm.expectEmit(true, true, false, true);
+        emit Reclaimed(id, bob, 5 ether);
+        vm.prank(bob);
+        vd.reclaimBid(id);
+        assertEq(bob.balance, before + 5 ether, "exactly this claim, to this claimer");
+        // someone else can never reclaim it
+        vm.prank(alice);
+        vm.expectRevert(bytes("Not winner"));
+        vd.reclaimBid(id);
+    }
 }
