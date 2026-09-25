@@ -3,6 +3,14 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {PentagonVaultDrops} from "../src/VaultDrops.sol";
+import {TransparentUpgradeableProxy, ITransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {ProxyAdmin} from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {ERC1967Utils} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
+
+// Stand-in for a future fix/tuning release: same storage, one new view.
+contract PentagonVaultDropsV2 is PentagonVaultDrops {
+    function version() external pure returns (uint256) { return 2; }
+}
 
 contract VaultDropsTest is Test {
     PentagonVaultDrops vd;
@@ -16,9 +24,25 @@ contract VaultDropsTest is Test {
     uint64 constant PRIZE_CHAIN = 1;
     address constant PRIZE_CONTRACT = 0x67abaDDb1258077F7900abD8AdE0EcC6CdC38ac2;
 
+    // Mirrors production: a throwaway deployer creates impl + proxy, but ownership AND upgrade
+    // rights go to the hardware wallet (`hw`) in the same transactions — the deployer keeps nothing.
+    address hw = makeAddr("hw");
+    address deployer = makeAddr("throwawayDeployer");
+    ProxyAdmin admin;
+
     function setUp() public {
-        vd = new PentagonVaultDrops(); // owner = this
-        vd.setConfig(7 days);
+        vm.startPrank(deployer);
+        PentagonVaultDrops impl = new PentagonVaultDrops();
+        TransparentUpgradeableProxy proxy = new TransparentUpgradeableProxy(
+            address(impl), hw, abi.encodeCall(PentagonVaultDrops.initialize, (hw))
+        );
+        vm.stopPrank();
+        vd = PentagonVaultDrops(payable(address(proxy)));
+        admin = ProxyAdmin(address(uint160(uint256(vm.load(address(proxy), ERC1967Utils.ADMIN_SLOT)))));
+        // Tests drive owner-only calls from this contract: hw hands ownership over (two-step).
+        vm.prank(hw);
+        vd.transferOwnership(address(this));
+        vd.acceptOwnership();
         vm.deal(alice, 100 ether);
         vm.deal(bob, 100 ether);
     }
@@ -281,5 +305,45 @@ contract VaultDropsTest is Test {
         vm.prank(alice);
         vm.expectRevert(bytes("Not winner"));
         vd.reclaimBid(id);
+    }
+
+    // ─── Proxy / upgrade rights ─────────────────────────────────
+    function testDeployerKeepsNothing() public view {
+        assertEq(admin.owner(), hw, "only hw can upgrade");
+        assertTrue(vd.owner() != deployer && admin.owner() != deployer, "throwaway holds no authority");
+        assertEq(vd.fulfillWindow(), 7 days, "initialized behind the proxy");
+    }
+
+    function testOnlyHwCanUpgradeAndStateSurvives() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        PentagonVaultDropsV2 v2 = new PentagonVaultDropsV2();
+        // anyone else — including the deployer and the contract owner — cannot upgrade
+        vm.prank(deployer);
+        vm.expectRevert();
+        admin.upgradeAndCall(ITransparentUpgradeableProxy(address(vd)), address(v2), "");
+        vm.expectRevert();
+        admin.upgradeAndCall(ITransparentUpgradeableProxy(address(vd)), address(v2), "");
+        // hw can
+        vm.prank(hw);
+        admin.upgradeAndCall(ITransparentUpgradeableProxy(address(vd)), address(v2), "");
+        assertEq(PentagonVaultDropsV2(payable(address(vd))).version(), 2);
+        // claims + escrow survive the upgrade
+        (, , , , , , , uint256 hb, address hbr, , , ) = vd.drops(id);
+        assertEq(hbr, bob);
+        assertEq(hb, 5 ether);
+        assertEq(address(vd).balance, 5 ether);
+    }
+
+    function testImplementationCannotBeInitialized() public {
+        PentagonVaultDrops impl = new PentagonVaultDrops();
+        vm.expectRevert();
+        impl.initialize(address(this));
+    }
+
+    function testProxyCannotBeReinitialized() public {
+        vm.expectRevert();
+        vd.initialize(alice);
     }
 }

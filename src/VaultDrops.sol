@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
@@ -21,7 +21,11 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *
  *      ⚠ UNAUDITED. forge test + audit before deployment. Holds bidder funds.
  */
-contract PentagonVaultDrops is Ownable, ReentrancyGuard {
+/// @dev UPGRADEABLE (nftprof 2026-09-25): deployed behind a TransparentUpgradeableProxy whose
+///      ProxyAdmin is owned by the treasury hardware wallet — only it can upgrade (fixes/tuning).
+///      Rules for every future version: never reorder/remove state vars; only append, consuming
+///      `__gap`. ReentrancyGuard (OZ 5) keeps its flag in a namespaced slot, so it's proxy-safe.
+contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     struct Drop {
         // prize reference (informational — the prize lives on another chain, in the treasury)
         uint64 prizeChainId;
@@ -48,11 +52,19 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     mapping(uint256 => Drop) public drops;
     mapping(address => uint256) public pendingReturns; // griefing-safe native refund fallback
 
-    uint64 public fulfillWindow = 7 days; // reclaim failsafe after this
+    uint64 public fulfillWindow; // reclaim failsafe after this (7 days, set in initialize)
     // PC from DELIVERED claims (nftprof 2026-09-25: no burn, no auto-transfer — it stays in the
     // contract and the owner may withdraw it later). Open claims are never part of this: a claim's
     // PC moves here only when its NFT is delivered, so withdrawals can't touch anyone's escrow.
     uint256 public proceeds;
+
+    // Owner (two-step transfer). Plain storage instead of OZ Ownable so it can be set by
+    // initialize() behind the proxy.
+    address public owner;
+    address public pendingOwner;
+
+    // Reserved for future versions' state (append-only upgrades).
+    uint256[40] private __gap;
 
     event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
     event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
@@ -73,7 +85,37 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
     event ProceedsWithdrawn(address indexed to, uint256 amount);
     event PendingReturnWithdrawn(address indexed account, uint256 amount);
 
-    constructor() Ownable(msg.sender) {}
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers(); // the bare implementation can never be initialized or used
+    }
+
+    function initialize(address owner_) external initializer {
+        require(owner_ != address(0), "Zero owner");
+        owner = owner_;
+        fulfillWindow = 7 days;
+        emit OwnershipTransferred(address(0), owner_);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "Not pending owner");
+        emit OwnershipTransferred(owner, msg.sender);
+        owner = msg.sender;
+        pendingOwner = address(0);
+    }
 
     // ─── Create (project-only) ──────────────────────────────────
     function createDrop(
