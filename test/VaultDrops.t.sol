@@ -346,4 +346,33 @@ contract VaultDropsTest is Test {
         vm.expectRevert();
         vd.initialize(alice);
     }
+
+    // ─── reclaimFor: anyone can make the claimer whole after the window ──
+    function testReclaimForByAnyonePaysClaimer() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vm.expectRevert(bytes("Fulfill window open"));
+        vd.reclaimFor(id);
+        vm.warp(block.timestamp + 7 days);
+        uint256 before = bob.balance;
+        vm.prank(alice); // a stranger (or our keeper) triggers it — bob sends nothing
+        vd.reclaimFor(id);
+        assertEq(bob.balance, before + 5 ether, "full amount to the claimer, never the caller");
+        vm.expectRevert(bytes("Already reclaimed"));
+        vd.reclaimFor(id);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Already reclaimed"));
+        vd.reclaimBid(id);
+    }
+
+    function testReclaimForBlockedAfterDelivery() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vd.markFulfilled(id, bytes32(uint256(3)));
+        vm.warp(block.timestamp + 7 days);
+        vm.expectRevert(bytes("Fulfilled"));
+        vd.reclaimFor(id);
+    }
 }

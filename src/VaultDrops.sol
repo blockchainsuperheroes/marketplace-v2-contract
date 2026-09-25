@@ -242,18 +242,31 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
 
     // ─── Failsafe: full refund if the project doesn't deliver ──
     function reclaimBid(uint256 dropId) external nonReentrant {
+        require(msg.sender == drops[dropId].highestBidder, "Not winner");
+        _reclaim(dropId);
+    }
+
+    /// @notice Anyone may trigger the reclaim once the delivery window has passed; the full amount
+    ///         ALWAYS goes to the recorded claimer. Lets custodial / AA2 wallets (which may only call
+    ///         a single allowlisted function) be made whole without sending a transaction themselves.
+    function reclaimFor(uint256 dropId) external nonReentrant {
+        _reclaim(dropId);
+    }
+
+    function _reclaim(uint256 dropId) internal {
         Drop storage d = drops[dropId];
         require(d.settledAt != 0, "Not settled");
-        require(msg.sender == d.highestBidder, "Not winner");
+        require(d.highestBidder != address(0), "No winner");
         require(!d.fulfilled, "Fulfilled");
         require(!d.reclaimed, "Already reclaimed");
         require(block.timestamp >= uint256(d.settledAt) + fulfillWindow, "Fulfill window open");
         d.reclaimed = true;
         uint256 amount = d.highestBid;
-        (bool ok, ) = payable(msg.sender).call{value: amount}("");
-        require(ok, "Refund failed");
-        emit BidReclaimed(dropId, msg.sender, amount);
-        emit Reclaimed(dropId, msg.sender, amount);
+        address claimer = d.highestBidder;
+        // Push to the claimer; if its wallet can't receive right now, it's parked for withdrawPending.
+        _refund(claimer, amount);
+        emit BidReclaimed(dropId, claimer, amount);
+        emit Reclaimed(dropId, claimer, amount);
     }
 
     // ─── Escape hatch: wrong markFulfilled ──────────────────────
