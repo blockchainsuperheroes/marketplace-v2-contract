@@ -168,14 +168,11 @@ contract VaultDropsTest is Test {
         id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 43, 1 ether, 1 days, 0, 5 ether);
     }
 
-    function testRedeemSettlesInstantlyAndRefundsBidder() public {
+    function testClaimSettlesInstantly() public {
         uint256 id = _createRedeemable();
-        vm.prank(alice);
-        vd.bid{value: 2 ether}(id);
-        uint256 aliceBefore = alice.balance;
         vm.prank(bob);
         vd.redeem{value: 5 ether}(id);
-        assertEq(alice.balance, aliceBefore + 2 ether, "outbid bidder refunded");
+        assertEq(address(vd).balance, 5 ether, "claim escrowed until delivery");
         (, , , , uint64 endTime, , , uint256 hb, address hbr, uint64 settledAt, , ) = vd.drops(id);
         assertEq(hbr, bob);
         assertEq(hb, 5 ether);
@@ -193,10 +190,13 @@ contract VaultDropsTest is Test {
         vm.prank(bob);
         vm.expectRevert(bytes("Pay exact redeem price"));
         vd.redeem{value: 4 ether}(id);
-        // bids at/above redeem price are pushed to redeem()
+        // a Points-claim drop can never be bid on — at any amount
         vm.prank(bob);
-        vm.expectRevert(bytes("Use redeem"));
-        vd.bid{value: 5 ether}(id);
+        vm.expectRevert(bytes("Points claim only"));
+        vd.bid{value: 1 ether}(id);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Points claim only"));
+        vd.bid{value: 9 ether}(id);
         // auction-only drop can't be redeemed
         uint256 id2 = _create();
         vm.prank(bob);

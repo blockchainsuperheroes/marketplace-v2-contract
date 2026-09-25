@@ -137,8 +137,9 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
 
         uint256 minBid = d.highestBid == 0 ? d.startPrice : d.highestBid + MIN_INCREMENT;
         require(msg.value >= minBid, "Bid too low");
-        // Don't let a bidder overpay past the instant price — redeem() is the right call there.
-        require(d.redeemPrice == 0 || msg.value < d.redeemPrice, "Use redeem");
+        // Points-claim drops (redeemPrice set) are NEVER auctions: claim at the fixed price only.
+        // PC bidding lives in the Auction House; the two are deliberately not mixed (nftprof).
+        require(d.redeemPrice == 0, "Points claim only");
 
         address prev = d.highestBidder;
         uint256 prevBid = d.highestBid;
@@ -152,6 +153,7 @@ contract PentagonVaultDrops is Ownable, ReentrancyGuard {
 
     function increaseBid(uint256 dropId) external payable nonReentrant {
         Drop storage d = drops[dropId];
+        require(d.redeemPrice == 0, "Points claim only");
         require(d.highestBidder == msg.sender, "Not highest bidder");
         require(d.settledAt == 0, "Settled");
         require(block.timestamp < d.endTime, "Ended");
