@@ -99,6 +99,7 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     event SellerListed(uint256 indexed dropId, address indexed seller, address collection, uint256 tokenId, uint256 lockId, uint256 price);
     event DeliverTo(uint256 indexed dropId, address indexed deliverTo);
     event SellerPaid(uint256 indexed dropId, address indexed seller, uint256 sellerAmount, uint256 fee);
+    event PriceUpdated(uint256 indexed dropId, uint256 price);
 
     uint256 public constant FEE_BPS = 1000; // 10% to the project on seller listings
     uint256 public constant BPS_DENOM = 10000;
@@ -171,6 +172,21 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         require(d.highestBidder == address(0), "Has bids");
         d.settledAt = uint64(block.timestamp);
         emit DropCancelled(dropId);
+    }
+
+    /// @notice v4 — change the price of an open, unclaimed Points listing IN PLACE (never a second
+    ///         listing). Project listings: owner only. Seller listings: that seller only. A buyer's claim
+    ///         must pay the exact current price, so a claim sent before a change simply reverts.
+    function updatePrice(uint256 dropId, uint256 newPrice) external {
+        Drop storage d = drops[dropId];
+        require(d.endTime != 0 && d.settledAt == 0 && d.highestBidder == address(0), "Not open");
+        require(d.redeemPrice != 0, "Not a Points listing");
+        address lister = sellerOf[dropId];
+        require(lister == address(0) ? msg.sender == owner : msg.sender == lister, "Not lister");
+        require(newPrice >= MIN_INCREMENT, "Price too low");
+        d.startPrice = newPrice;
+        d.redeemPrice = newPrice;
+        emit PriceUpdated(dropId, newPrice);
     }
 
     /// One open listing per (prize token, lister) — a stranger's listing can never block the real one.

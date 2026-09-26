@@ -522,6 +522,30 @@ contract VaultDropsTest is Test {
         vm.expectRevert(bytes("Already reclaimed"));
         vd.refundUndelivered(id);
     }
+
+    // ─── price change in place ──────────────────────────────────
+    function testUpdatePriceInPlace_projectAndSeller() public {
+        uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 700, 1 ether, 0, 0, 1 ether);
+        vd.updatePrice(id, 3 ether);
+        assertEq(vd.dropCounter(), id, "no new listing created");
+        vm.prank(bob);
+        vm.expectRevert(bytes("Pay exact redeem price")); // a claim at the old price can't go through
+        vd.redeem{value: 1 ether}(id);
+        vm.prank(bob);
+        vd.redeem{value: 3 ether}(id);
+        vm.expectRevert(bytes("Not open")); // can't reprice once claimed
+        vd.updatePrice(id, 5 ether);
+
+        vm.prank(seller);
+        uint256 sid = vd.listForPoints(PRIZE_CONTRACT, 701, 9, 2 ether);
+        vm.expectRevert(bytes("Not lister")); // owner can't reprice a seller's listing
+        vd.updatePrice(sid, 1 ether);
+        vm.prank(alice);
+        vm.expectRevert(bytes("Not lister"));
+        vd.updatePrice(sid, 1 ether);
+        vm.prank(seller);
+        vd.updatePrice(sid, 4 ether);
+    }
 }
 
 contract HostileSeller {
