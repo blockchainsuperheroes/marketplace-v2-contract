@@ -181,9 +181,13 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         liveDropOf[k] = dropId;
     }
 
+    /// A listing holds its (token, lister) slot while unclaimed AND while a claim on it is still
+    /// waiting to be delivered or refunded — so one NFT can never be sold twice.
     function _isOpen(uint256 dropId) internal view returns (bool) {
         Drop storage d = drops[dropId];
-        return d.endTime != 0 && d.settledAt == 0;
+        if (d.endTime == 0) return false;
+        if (d.settledAt == 0) return true;
+        return d.highestBidder != address(0) && !d.fulfilled && !d.reclaimed;
     }
 
     function _createDrop(
@@ -233,7 +237,7 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     ///         claim delivers to the user's bound EOA, since the AA2 address may not exist on Ethereum).
     ///         Refunds (reclaim) still go to the claimer, never to deliverTo.
     function redeem(uint256 dropId, address deliverTo) external payable nonReentrant {
-        require(deliverTo != address(0), "Zero deliverTo");
+        require(deliverTo != address(0) && deliverTo != address(this), "Bad deliverTo");
         _redeem(dropId);
         deliverToOf[dropId] = deliverTo;
         emit DeliverTo(dropId, deliverTo);
@@ -326,7 +330,9 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         } else {
             uint256 fee = (amount * FEE_BPS) / BPS_DENOM;
             proceeds += fee;
-            _refund(seller, amount - fee); // push to the seller; parks in pendingReturns if it can't receive
+            // CREDIT, never push: a hostile seller wallet (reverting / returndata bomb) must not be able
+            // to block the delivery receipt. The seller (or anyone for them) withdraws via withdrawPending*.
+            pendingReturns[seller] += amount - fee;
             emit SellerPaid(dropId, seller, amount - fee, fee);
         }
         emit DropFulfilled(dropId, d.highestBidder, prizeTxHash, amount);
@@ -384,6 +390,33 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         require(ok, "Refund failed");
         emit BidReclaimed(dropId, d.highestBidder, amount);
         emit Reclaimed(dropId, d.highestBidder, amount);
+    }
+
+    /// @notice v4 — the owner refunds a claim that can't be delivered (withdrawn lock, bad listing,
+    ///         unreceivable seller…) immediately, instead of the claimer waiting the full window.
+    ///         Pays exactly that claim's amount to the claimer; blocked once delivered.
+    function refundUndelivered(uint256 dropId) external onlyOwner nonReentrant {
+        Drop storage d = drops[dropId];
+        require(d.settledAt != 0 && d.highestBidder != address(0), "Not claimed");
+        require(!d.fulfilled, "Fulfilled");
+        require(!d.reclaimed, "Already reclaimed");
+        d.reclaimed = true;
+        uint256 amount = d.highestBid;
+        address claimer = d.highestBidder;
+        _refund(claimer, amount);
+        emit BidReclaimed(dropId, claimer, amount);
+        emit Reclaimed(dropId, claimer, amount);
+    }
+
+    /// @notice v4 — anyone may push an account's pending balance (e.g. a seller's 90%) to it. Paid only
+    ///         to `account`; if that wallet can't receive, only this call fails.
+    function withdrawPendingFor(address account) external nonReentrant {
+        uint256 amount = pendingReturns[account];
+        require(amount > 0, "Nothing to withdraw");
+        pendingReturns[account] = 0;
+        (bool ok, ) = payable(account).call{value: amount}("");
+        require(ok, "Withdraw failed");
+        emit PendingReturnWithdrawn(account, amount);
     }
 
     // ─── Owner proceeds (delivered claims only) ─────────────────

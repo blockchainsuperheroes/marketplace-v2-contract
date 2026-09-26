@@ -37,6 +37,10 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
         uint256 tokenId;
         address depositor; // who checked it in — a withdraw only ever returns it here
         Status status;
+        /// Pentagon address the depositor names to receive the sale proceeds (need not equal the
+        /// depositor: covers smart-contract wallets and AA2 users). The keeper only pays a Pentagon
+        /// listing whose seller equals this.
+        address payout;
     }
 
     struct PendingRoles {
@@ -82,6 +86,7 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
     event RolesProposed(address admin, address keeper, uint64 eta);
     event RolesCancelled(uint256 nonce);
     event CheckedIn(uint256 indexed lockId, address indexed collection, uint256 indexed tokenId, address depositor);
+    event PayoutSet(uint256 indexed lockId, address payout);
     event Released(uint256 indexed lockId, address indexed collection, uint256 indexed tokenId, address to);
     event Withdrawn(uint256 indexed lockId, address indexed collection, uint256 indexed tokenId, address to);
 
@@ -109,7 +114,8 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
 
     // ─── Check-in (any holder) ──────────────────────────────────
     /// @notice Pulls `tokenId` from the caller (approve first) and locks it with the caller as depositor.
-    function checkIn(address collection, uint256 tokenId) external nonReentrant returns (uint256 lockId) {
+    ///         `payout` = the Pentagon wallet that may list it and receive the proceeds (0 = the caller).
+    function checkIn(address collection, uint256 tokenId, address payout) external nonReentrant returns (uint256 lockId) {
         if (collection == address(0)) revert ZeroAddress();
         if (lockOf[collection][tokenId] != 0) revert AlreadyLocked();
         // Only standard ERC-721s: release/withdraw use safeTransferFrom.
@@ -120,7 +126,8 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
         }
         if (IERC721(collection).ownerOf(tokenId) != msg.sender) revert NotHeld();
         lockId = ++lockCount;
-        locks[lockId] = Lock({collection: collection, tokenId: tokenId, depositor: msg.sender, status: Status.Locked});
+        address p = payout == address(0) ? msg.sender : payout;
+        locks[lockId] = Lock({collection: collection, tokenId: tokenId, depositor: msg.sender, status: Status.Locked, payout: p});
         lockOf[collection][tokenId] = lockId;
         _expectCollection = collection;
         _expectTokenId = tokenId;
@@ -131,6 +138,7 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
         _expectTokenId = 0;
         if (IERC721(collection).ownerOf(tokenId) != address(this)) revert NotHeld();
         emit CheckedIn(lockId, collection, tokenId, msg.sender);
+        emit PayoutSet(lockId, p);
     }
 
     // ─── Release to a winner (keeper + admin signature) ─────────
@@ -222,7 +230,8 @@ contract PentagonPrizeLockerOpen is EIP712, IERC721Receiver, ReentrancyGuard {
 
     /// Accepts ONLY the exact transfer checkIn is performing (this contract as operator, the expected
     /// collection and tokenId). Everything else is refused, so nothing can arrive unregistered via
-    /// safeTransferFrom. (Plain transferFrom can't be refused by any contract — checkIn adopts those.)
+    /// safeTransferFrom. (Plain transferFrom can't be refused by any contract. Tokens sent that way are NOT
+    /// adopted here and can't be recovered — always use checkIn.)
     function onERC721Received(address operator, address, uint256 tokenId, bytes calldata) external view override returns (bytes4) {
         if (!_checkingIn || operator != address(this) || msg.sender != _expectCollection || tokenId != _expectTokenId) {
             revert UnexpectedTransfer();

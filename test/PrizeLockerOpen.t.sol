@@ -36,10 +36,10 @@ contract PrizeLockerOpenTest is Test {
     }
 
     function test_anyHolderChecksIn_recordedAsDepositor() public {
-        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1);
-        vm.prank(bob); uint256 b = locker.checkIn(address(nft), 2);
-        (, , address da, ) = locker.locks(a);
-        (, , address db, ) = locker.locks(b);
+        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1, address(0));
+        vm.prank(bob); uint256 b = locker.checkIn(address(nft), 2, address(0));
+        (, , address da, , ) = locker.locks(a);
+        (, , address db, , ) = locker.locks(b);
         assertEq(da, alice);
         assertEq(db, bob);
         assertEq(nft.ownerOf(1), address(locker));
@@ -48,18 +48,18 @@ contract PrizeLockerOpenTest is Test {
     function test_cannotCheckInSomeoneElsesNFT() public {
         vm.prank(bob);
         vm.expectRevert(PentagonPrizeLockerOpen.NotHeld.selector);
-        locker.checkIn(address(nft), 1); // alice's token, bob is approved-for-nothing
+        locker.checkIn(address(nft), 1, address(0)); // alice's token, bob is approved-for-nothing
     }
 
     function test_strayTransferCannotBeAdoptedByAnyone() public {
         vm.prank(alice); nft.transferFrom(alice, address(locker), 1); // mistaken plain transfer
         vm.prank(bob);
         vm.expectRevert(PentagonPrizeLockerOpen.NotHeld.selector);
-        locker.checkIn(address(nft), 1);
+        locker.checkIn(address(nft), 1, address(0));
     }
 
     function test_withdrawOnlyThatLocksDepositor_withAdminSig() public {
-        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1);
+        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1, address(0));
         uint256 dl = block.timestamp + 1 hours;
         bytes memory sig = _sign(ADMIN_PK, locker.withdrawDigest(a, dl));
         vm.prank(bob);
@@ -71,7 +71,7 @@ contract PrizeLockerOpenTest is Test {
     }
 
     function test_depositorCannotWithdrawAlone() public {
-        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1);
+        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1, address(0));
         uint256 dl = block.timestamp + 1 hours;
         bytes memory selfSig = _sign(OTHER_PK, locker.withdrawDigest(a, dl));
         vm.prank(alice);
@@ -80,7 +80,7 @@ contract PrizeLockerOpenTest is Test {
     }
 
     function test_releaseNeedsKeeperAndAdminSig() public {
-        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1);
+        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1, address(0));
         uint256 dl = block.timestamp + 1 hours;
         bytes memory sig = _sign(ADMIN_PK, locker.releaseDigest(a, winner, dl));
         vm.prank(alice);
@@ -107,5 +107,15 @@ contract PrizeLockerOpenTest is Test {
         vm.prank(alice);
         vm.expectRevert(PentagonPrizeLockerOpen.UnexpectedTransfer.selector);
         nft.safeTransferFrom(alice, address(locker), 1);
+    }
+
+    function test_payoutAddressRecorded_defaultsToDepositor() public {
+        address pentagonPayout = makeAddr("pentagonPayout");
+        vm.prank(alice); uint256 a = locker.checkIn(address(nft), 1, pentagonPayout);
+        vm.prank(bob); uint256 b = locker.checkIn(address(nft), 2, address(0));
+        (, , , , address pa) = locker.locks(a);
+        (, , , , address pb) = locker.locks(b);
+        assertEq(pa, pentagonPayout);
+        assertEq(pb, bob);
     }
 }

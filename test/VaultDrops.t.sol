@@ -413,8 +413,11 @@ contract VaultDropsTest is Test {
         vd.redeem{value: 10 ether}(id, eoa);
         assertEq(vd.deliverToOf(id), eoa, "delivery address recorded on-chain");
         vd.markFulfilled(id, bytes32(uint256(5)));
-        assertEq(seller.balance, 9 ether, "seller gets 90%");
+        assertEq(vd.pendingReturns(seller), 9 ether, "seller credited 90%");
         assertEq(vd.proceeds(), 1 ether, "project keeps 10%");
+        vm.prank(alice); // anyone can push it to the seller
+        vd.withdrawPendingFor(seller);
+        assertEq(seller.balance, 9 ether, "seller paid 90%");
     }
 
     function testSellerListing_reclaimPaysClaimerNotSeller() public {
@@ -465,8 +468,11 @@ contract VaultDropsTest is Test {
     function testRedeemDeliverToZeroReverts() public {
         uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 504, 1 ether, 0, 0, 1 ether);
         vm.prank(bob);
-        vm.expectRevert(bytes("Zero deliverTo"));
+        vm.expectRevert(bytes("Bad deliverTo"));
         vd.redeem{value: 1 ether}(id, address(0));
+        vm.prank(bob);
+        vm.expectRevert(bytes("Bad deliverTo"));
+        vd.redeem{value: 1 ether}(id, address(vd));
     }
 
     function testProjectListingStill100PercentProceeds() public {
@@ -476,4 +482,48 @@ contract VaultDropsTest is Test {
         vd.markFulfilled(id, bytes32(uint256(6)));
         assertEq(vd.proceeds(), 3 ether);
     }
+
+    // ─── review fixes ───────────────────────────────────────────
+    function testCannotResellWhileClaimPending() public {
+        vm.prank(seller);
+        uint256 id = vd.listForPoints(PRIZE_CONTRACT, 600, 7, 1 ether);
+        vm.prank(bob);
+        vd.redeem{value: 1 ether}(id);
+        vm.prank(seller);
+        vm.expectRevert(bytes("Already listed")); // claimed, not yet delivered/refunded → still taken
+        vd.listForPoints(PRIZE_CONTRACT, 600, 7, 1 ether);
+        vd.refundUndelivered(id);
+        vm.prank(seller);
+        vd.listForPoints(PRIZE_CONTRACT, 600, 7, 1 ether); // freed once refunded
+    }
+
+    function testHostileSellerCannotBlockReceipt() public {
+        HostileSeller h = new HostileSeller();
+        vm.prank(address(h));
+        uint256 id = vd.listForPoints(PRIZE_CONTRACT, 601, 8, 1 ether);
+        vm.prank(bob);
+        vd.redeem{value: 1 ether}(id);
+        vd.markFulfilled(id, bytes32(uint256(9))); // must not revert even though the seller can't receive
+        assertEq(vd.pendingReturns(address(h)), 0.9 ether);
+        vm.expectRevert(bytes("Withdraw failed"));
+        vd.withdrawPendingFor(address(h)); // only the hostile seller's own payout is affected
+    }
+
+    function testRefundUndelivered_ownerOnly_paysClaimer() public {
+        uint256 id = _createRedeemable();
+        vm.prank(bob);
+        vd.redeem{value: 5 ether}(id);
+        vm.prank(alice);
+        vm.expectRevert(bytes("Not owner"));
+        vd.refundUndelivered(id);
+        uint256 before = bob.balance;
+        vd.refundUndelivered(id);
+        assertEq(bob.balance, before + 5 ether);
+        vm.expectRevert(bytes("Already reclaimed"));
+        vd.refundUndelivered(id);
+    }
+}
+
+contract HostileSeller {
+    receive() external payable { revert("no"); }
 }
