@@ -128,18 +128,21 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         uint256 redeemPrice
     ) external onlyOwner returns (uint256 dropId) {
         require(startPrice >= MIN_INCREMENT, "Start price too low");
-        require(duration > 0 && duration <= MAX_DURATION, "Bad duration");
+        // duration 0 = OPEN-ENDED Points-claim listing: stays up until claimed or delisted
+        // (cancelDrop). Auctions still need a bounded duration.
+        require((duration == 0 && redeemPrice != 0) || (duration > 0 && duration <= MAX_DURATION), "Bad duration");
         require(redeemPrice == 0 || redeemPrice >= startPrice, "Redeem below start");
         uint64 start = startTime == 0 ? uint64(block.timestamp) : startTime;
         require(start >= block.timestamp, "Start in past");
 
+        uint64 endTime = duration == 0 ? type(uint64).max : start + duration;
         dropId = ++dropCounter;
         drops[dropId] = Drop({
             prizeChainId: prizeChainId,
             prizeContract: prizeContract,
             prizeTokenId: prizeTokenId,
             startTime: start,
-            endTime: start + duration,
+            endTime: endTime,
             startPrice: startPrice,
             redeemPrice: redeemPrice,
             highestBid: 0,
@@ -148,7 +151,7 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
             fulfilled: false,
             reclaimed: false
         });
-        emit DropCreated(dropId, prizeChainId, prizeContract, prizeTokenId, startPrice, start, start + duration, redeemPrice);
+        emit DropCreated(dropId, prizeChainId, prizeContract, prizeTokenId, startPrice, start, endTime, redeemPrice);
     }
 
     // ─── Redeem now (fixed price, first come first served) ─────

@@ -375,4 +375,28 @@ contract VaultDropsTest is Test {
         vm.expectRevert(bytes("Fulfilled"));
         vd.reclaimFor(id);
     }
+
+    // ─── open-ended Points listings (no expiry until claimed or delisted) ──
+    function testOpenEndedClaimListingStaysUpUntilDelisted() public {
+        uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 77, 2 ether, 0, 0, 2 ether);
+        assertEq(_endTime(id), type(uint64).max);
+        vm.warp(block.timestamp + 3650 days); // ten years later, still claimable
+        vm.prank(bob);
+        vd.redeem{value: 2 ether}(id);
+        (, , , , , , , , address who, , , ) = vd.drops(id);
+        assertEq(who, bob);
+    }
+
+    function testOpenEndedCanBeDelisted() public {
+        uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 78, 2 ether, 0, 0, 2 ether);
+        vd.cancelDrop(id);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Settled"));
+        vd.redeem{value: 2 ether}(id);
+    }
+
+    function testOpenEndedOnlyForClaims() public {
+        vm.expectRevert(bytes("Bad duration"));
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 79, 1 ether, 0, 0, 0); // auction must have an end
+    }
 }
