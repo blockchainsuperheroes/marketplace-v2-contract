@@ -63,8 +63,19 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     address public owner;
     address public pendingOwner;
 
+    // ── v4 (append-only; 4 slots taken from __gap) ──
+    /// Seller of a user listing (0 = project listing). Paid SELLER_BPS of the claim on delivery.
+    mapping(uint256 => address) public sellerOf;
+    /// The Ethereum PentagonPrizeLockerOpen lock id the seller named for this listing (informational;
+    /// the store page and the keeper verify it on Ethereum).
+    mapping(uint256 => uint256) public lockIdOf;
+    /// Where the claimer asked the NFT to be delivered on Ethereum (0 = the claimer's own address).
+    mapping(uint256 => address) public deliverToOf;
+    /// One live listing per prize token: keccak(collection, tokenId) → open dropId (0 = none).
+    mapping(bytes32 => uint256) public liveDropOf;
+
     // Reserved for future versions' state (append-only upgrades).
-    uint256[40] private __gap;
+    uint256[36] private __gap;
 
     event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
     event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
@@ -84,6 +95,13 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     event ConfigUpdated(uint64 fulfillWindow);
     event ProceedsWithdrawn(address indexed to, uint256 amount);
     event PendingReturnWithdrawn(address indexed account, uint256 amount);
+
+    event SellerListed(uint256 indexed dropId, address indexed seller, address collection, uint256 tokenId, uint256 lockId, uint256 price);
+    event DeliverTo(uint256 indexed dropId, address indexed deliverTo);
+    event SellerPaid(uint256 indexed dropId, address indexed seller, uint256 sellerAmount, uint256 fee);
+
+    uint256 public constant FEE_BPS = 1000; // 10% to the project on seller listings
+    uint256 public constant BPS_DENOM = 10000;
 
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
@@ -127,6 +145,56 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         uint64 startTime,
         uint256 redeemPrice
     ) external onlyOwner returns (uint256 dropId) {
+        dropId = _createDrop(prizeChainId, prizeContract, prizeTokenId, startPrice, duration, startTime, redeemPrice);
+        if (redeemPrice != 0) _takeLiveSlot(prizeContract, prizeTokenId, address(0), dropId);
+    }
+
+    /// @notice v4 — any holder lists THEIR checked-in Ethereum NFT for Points. The seller is the caller
+    ///         and is paid (100% − FEE_BPS) of the claim when the NFT is delivered. The store page and
+    ///         the keeper only honour a listing whose Ethereum lock `lockId` holds (collection, tokenId)
+    ///         with depositor == seller; anything else is never shown and can never be delivered or paid.
+    function listForPoints(address collection, uint256 tokenId, uint256 lockId, uint256 price) external returns (uint256 dropId) {
+        require(collection != address(0), "Zero collection");
+        require(lockId != 0, "Lock id required");
+        dropId = _createDrop(1, collection, tokenId, price, 0, 0, price);
+        sellerOf[dropId] = msg.sender;
+        lockIdOf[dropId] = lockId;
+        _takeLiveSlot(collection, tokenId, msg.sender, dropId);
+        emit SellerListed(dropId, msg.sender, collection, tokenId, lockId, price);
+    }
+
+    /// @notice v4 — the seller takes down their own listing while it's unclaimed.
+    function sellerDelist(uint256 dropId) external {
+        Drop storage d = drops[dropId];
+        require(sellerOf[dropId] != address(0) && msg.sender == sellerOf[dropId], "Not seller");
+        require(d.endTime != 0 && d.settledAt == 0, "Invalid drop");
+        require(d.highestBidder == address(0), "Has bids");
+        d.settledAt = uint64(block.timestamp);
+        emit DropCancelled(dropId);
+    }
+
+    /// One open listing per (prize token, lister) — a stranger's listing can never block the real one.
+    function _takeLiveSlot(address collection, uint256 tokenId, address lister, uint256 dropId) internal {
+        bytes32 k = keccak256(abi.encode(collection, tokenId, lister));
+        uint256 cur = liveDropOf[k];
+        require(cur == 0 || !_isOpen(cur), "Already listed");
+        liveDropOf[k] = dropId;
+    }
+
+    function _isOpen(uint256 dropId) internal view returns (bool) {
+        Drop storage d = drops[dropId];
+        return d.endTime != 0 && d.settledAt == 0;
+    }
+
+    function _createDrop(
+        uint64 prizeChainId,
+        address prizeContract,
+        uint256 prizeTokenId,
+        uint256 startPrice,
+        uint64 duration,
+        uint64 startTime,
+        uint256 redeemPrice
+    ) internal returns (uint256 dropId) {
         require(startPrice >= MIN_INCREMENT, "Start price too low");
         // duration 0 = OPEN-ENDED Points-claim listing: stays up until claimed or delisted
         // (cancelDrop). Auctions still need a bounded duration.
@@ -158,6 +226,20 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     /// @notice Straight redemption: pay `redeemPrice` and the drop settles to you instantly.
     ///         Any standing highest bidder is refunded. Same escrow/fulfill/reclaim path after.
     function redeem(uint256 dropId) external payable nonReentrant {
+        _redeem(dropId);
+    }
+
+    /// @notice v4 — claim and name the Ethereum wallet that receives the NFT (e.g. a PG Balance / AA2
+    ///         claim delivers to the user's bound EOA, since the AA2 address may not exist on Ethereum).
+    ///         Refunds (reclaim) still go to the claimer, never to deliverTo.
+    function redeem(uint256 dropId, address deliverTo) external payable nonReentrant {
+        require(deliverTo != address(0), "Zero deliverTo");
+        _redeem(dropId);
+        deliverToOf[dropId] = deliverTo;
+        emit DeliverTo(dropId, deliverTo);
+    }
+
+    function _redeem(uint256 dropId) internal {
         Drop storage d = drops[dropId];
         require(d.endTime != 0, "No drop");
         require(d.redeemPrice != 0, "Not redeemable");
@@ -238,7 +320,15 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
         d.fulfilled = true;
 
         uint256 amount = d.highestBid;
-        proceeds += amount; // stays in the contract; owner may withdraw later
+        address seller = sellerOf[dropId];
+        if (seller == address(0)) {
+            proceeds += amount; // project listing: stays in the contract; owner may withdraw later
+        } else {
+            uint256 fee = (amount * FEE_BPS) / BPS_DENOM;
+            proceeds += fee;
+            _refund(seller, amount - fee); // push to the seller; parks in pendingReturns if it can't receive
+            emit SellerPaid(dropId, seller, amount - fee, fee);
+        }
         emit DropFulfilled(dropId, d.highestBidder, prizeTxHash, amount);
         emit Delivered(dropId, amount);
     }
@@ -274,7 +364,8 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
 
     // ─── Escape hatch: wrong markFulfilled ──────────────────────
     /// @notice markFulfilled permanently blocks reclaimBid, so a mistaken mark (NFT never actually
-    ///         delivered) would leave the claimer with neither. The owner makes the claimer whole with
+    ///         delivered) would leave the claimer with neither. (For a seller listing the seller was
+    ///         already paid at the mark, so a no-value refund draws on other project proceeds.) The owner makes the claimer whole with
     ///         exactly that claim's amount — from proceeds (send no value) or freshly funded (send the
     ///         exact amount, e.g. if proceeds were already withdrawn). `fulfilled` stays set.
     function ownerRefund(uint256 dropId) external payable onlyOwner nonReentrant {

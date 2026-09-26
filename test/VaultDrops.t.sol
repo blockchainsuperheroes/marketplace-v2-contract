@@ -399,4 +399,81 @@ contract VaultDropsTest is Test {
         vm.expectRevert(bytes("Bad duration"));
         vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 79, 1 ether, 0, 0, 0); // auction must have an end
     }
+
+    // ─── v4: seller listings, 90/10 split, deliverTo, one live listing ──
+    address seller = makeAddr("seller");
+    address eoa = makeAddr("boundEOA");
+
+    function testSellerListing_claimDeliver_pays90_10() public {
+        vm.prank(seller);
+        uint256 id = vd.listForPoints(PRIZE_CONTRACT, 500, 3, 10 ether);
+        assertEq(vd.sellerOf(id), seller);
+        assertEq(vd.lockIdOf(id), 3);
+        vm.prank(bob);
+        vd.redeem{value: 10 ether}(id, eoa);
+        assertEq(vd.deliverToOf(id), eoa, "delivery address recorded on-chain");
+        vd.markFulfilled(id, bytes32(uint256(5)));
+        assertEq(seller.balance, 9 ether, "seller gets 90%");
+        assertEq(vd.proceeds(), 1 ether, "project keeps 10%");
+    }
+
+    function testSellerListing_reclaimPaysClaimerNotSeller() public {
+        vm.prank(seller);
+        uint256 id = vd.listForPoints(PRIZE_CONTRACT, 501, 4, 2 ether);
+        vm.prank(bob);
+        vd.redeem{value: 2 ether}(id, eoa);
+        vm.warp(block.timestamp + 7 days);
+        uint256 before = bob.balance;
+        vd.reclaimFor(id);
+        assertEq(bob.balance, before + 2 ether, "refund goes to the claimer, not deliverTo or seller");
+        assertEq(seller.balance, 0);
+    }
+
+    function testSellerDelist_onlySeller_onlyUnclaimed() public {
+        vm.prank(seller);
+        uint256 id = vd.listForPoints(PRIZE_CONTRACT, 502, 5, 1 ether);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Not seller"));
+        vd.sellerDelist(id);
+        vm.prank(seller);
+        vd.sellerDelist(id);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Settled"));
+        vd.redeem{value: 1 ether}(id);
+        vm.prank(seller);
+        uint256 id2 = vd.listForPoints(PRIZE_CONTRACT, 502, 5, 1 ether); // relist after delist ok
+        vm.prank(bob);
+        vd.redeem{value: 1 ether}(id2);
+        vm.prank(seller);
+        vm.expectRevert(bytes("Invalid drop")); // claimed = settled: can't be delisted any more
+        vd.sellerDelist(id2);
+    }
+
+    function testOneLiveListingPerLister_strangerCannotBlock() public {
+        vm.prank(seller);
+        vd.listForPoints(PRIZE_CONTRACT, 503, 6, 1 ether);
+        vm.prank(seller);
+        vm.expectRevert(bytes("Already listed"));
+        vd.listForPoints(PRIZE_CONTRACT, 503, 6, 2 ether);
+        vm.prank(alice); // a stranger's (fake) listing of the same token doesn't block anyone
+        vd.listForPoints(PRIZE_CONTRACT, 503, 6, 1 ether);
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 503, 1 ether, 0, 0, 1 ether); // project can still list
+        vm.expectRevert(bytes("Already listed"));
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 503, 1 ether, 0, 0, 1 ether); // but only once
+    }
+
+    function testRedeemDeliverToZeroReverts() public {
+        uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 504, 1 ether, 0, 0, 1 ether);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Zero deliverTo"));
+        vd.redeem{value: 1 ether}(id, address(0));
+    }
+
+    function testProjectListingStill100PercentProceeds() public {
+        uint256 id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 505, 1 ether, 0, 0, 3 ether);
+        vm.prank(bob);
+        vd.redeem{value: 3 ether}(id);
+        vd.markFulfilled(id, bytes32(uint256(6)));
+        assertEq(vd.proceeds(), 3 ether);
+    }
 }
