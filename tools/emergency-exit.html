@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Emergency exit · Pentagon Prize Locks</title>
+<style>
+  :root{--bg:#0a0a0b;--surf:#131316;--line:#2a2a31;--tx:#f4f4f5;--tx2:#c4c4cc;--gold:#f5c542;--ok:#4ade80;--bad:#f87171}
+  body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,Segoe UI,Arial}
+  main{max-width:760px;margin:32px auto;padding:0 16px}
+  h1{font-size:22px;margin:0 0 6px} h2{font-size:15px;margin:22px 0 8px}
+  .muted{color:var(--tx2)} .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}
+  .card{background:var(--surf);border:1px solid var(--line);border-radius:8px;padding:14px;margin-top:12px}
+  label{display:block;margin:8px 0 4px;color:var(--tx2);font-size:12px}
+  input,select,textarea{width:100%;box-sizing:border-box;background:#0f0f12;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:8px;font:12px ui-monospace,Consolas,monospace}
+  button{background:var(--gold);color:#000;border:0;border-radius:6px;padding:9px 14px;font-weight:700;cursor:pointer;margin:10px 8px 0 0}
+  button.sec{background:transparent;color:var(--tx);border:1px solid var(--line)}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .row{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid var(--line)}
+</style></head>
+<body><main>
+<h1>Emergency exit: take an NFT out of a Pentagon Prize Lock</h1>
+<p class="muted">Works without the Redeem website, its server or the keeper. It talks straight to the lock on <b>Ethereum mainnet</b> through your wallet (MetaMask etc.).
+It needs two wallets: the <b>lock admin</b> (0xB2e3…EF61f) signs an approval (free), and the <b>depositor</b> (the wallet that checked the NFT in) sends the withdraw.
+The lock only ever returns an NFT to its depositor. Open this file from your disk, or serve it with <span class="mono">npx serve</span> if your wallet ignores <span class="mono">file://</span> pages.</p>
+<p class="muted"><b>Before withdrawing a listed piece, delist it on Pentagon Chain</b> (see EMERGENCY-EXIT.md), otherwise someone could still claim the listing and would have to reclaim their payment.</p>
+
+<div class="card">
+  <button id="connect" class="sec">Connect wallet</button> <span id="acct" class="mono muted">not connected</span>
+  <label>Lock</label>
+  <select id="lock">
+    <option value="open">Seller lock (PentagonPrizeLockerOpen) · 0x1AFc17a1B64Cb7095d68CD360e4766f951983aB9</option>
+    <option value="project">Pentagon lock (PentagonPrizeLocker) · 0x7c0faC2561471A9810a5609e6FeD86af0A6d0924</option>
+  </select>
+  <label>NFT collection address</label><input id="collection" placeholder="0x…"/>
+  <label>Token ID</label><input id="tokenId" placeholder="e.g. 19015"/>
+  <button id="read">1 · Look it up</button>
+  <div id="info" class="mono" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+  <h2>2 · Admin approval (sign as 0xB2e3 — free, no transaction)</h2>
+  <button id="sign" disabled>Sign withdraw approval</button>
+  <label>Approval (copy this to the depositor, or keep it here)</label>
+  <textarea id="approval" rows="4" placeholder='{"lockId":…,"deadline":…,"sig":"0x…"}'></textarea>
+</div>
+
+<div class="card">
+  <h2>3 · Withdraw (send as the depositor — pays Ethereum gas)</h2>
+  <button id="withdraw" disabled>Withdraw to the depositor</button>
+  <div id="status" class="muted" style="margin-top:8px"></div>
+</div>
+
+<script>
+const LOCKS = {
+  open:    { address: '0x1AFc17a1B64Cb7095d68CD360e4766f951983aB9', name: 'PentagonPrizeLockerOpen', fields: 5 },
+  project: { address: '0x7c0faC2561471A9810a5609e6FeD86af0A6d0924', name: 'PentagonPrizeLocker', fields: 4 },
+};
+const $ = (id) => document.getElementById(id);
+const pad = (hex) => hex.replace(/^0x/, '').padStart(64, '0');
+const word = (data, i) => '0x' + data.slice(2 + i * 64, 2 + (i + 1) * 64);
+const addrOf = (w) => '0x' + w.slice(-40);
+let acct, st = {};
+
+async function call(to, data) { return ethereum.request({ method: 'eth_call', params: [{ to, data }, 'latest'] }); }
+async function onMainnet() {
+  const c = await ethereum.request({ method: 'eth_chainId' });
+  if (c !== '0x1') { try { await ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0x1' }] }); } catch { throw new Error('Switch your wallet to Ethereum mainnet'); } }
+}
+
+$('connect').onclick = async () => {
+  if (!window.ethereum) return alert('No browser wallet found (install MetaMask).');
+  [acct] = await ethereum.request({ method: 'eth_requestAccounts' });
+  $('acct').textContent = acct;
+};
+
+$('read').onclick = async () => {
+  try {
+    await onMainnet();
+    const L = LOCKS[$('lock').value];
+    const col = $('collection').value.trim().toLowerCase(), tid = BigInt($('tokenId').value.trim());
+    if (!/^0x[0-9a-f]{40}$/.test(col)) throw new Error('Bad collection address');
+    const lockId = BigInt(await call(L.address, '0xb31d10b3' + pad(col) + pad(tid.toString(16))));           // lockOf(collection, tokenId)
+    if (lockId === 0n) { $('info').innerHTML = '<span class="bad">Not in this lock (lockOf = 0). Try the other lock, or it was already released/withdrawn.</span>'; return; }
+    const rec = await call(L.address, '0xf4dadc61' + pad(lockId.toString(16)));                               // locks(lockId)
+    const depositor = addrOf(word(rec, 2)), status = Number(BigInt(word(rec, 3)));
+    const admin = addrOf(await call(L.address, '0xf851a440'));                                                 // admin()
+    const nonce = BigInt(await call(L.address, '0xaffed0e0'));                                                  // nonce()
+    st = { L, lockId, col, tid, depositor, status, admin, nonce };
+    const S = ['None', 'Locked', 'Released', 'Withdrawn'][status] || status;
+    $('info').innerHTML = [
+      ['Lock id', lockId], ['Status', status === 1 ? '<span class="ok">Locked (can be withdrawn)</span>' : `<span class="bad">${S}</span>`],
+      ['Depositor (receives it)', depositor], ['Lock admin (must sign)', admin], ['Signature nonce', nonce],
+    ].map(([k, v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join('');
+    $('sign').disabled = status !== 1; $('withdraw').disabled = status !== 1;
+  } catch (e) { $('info').innerHTML = `<span class="bad">${e.message || e}</span>`; }
+};
+
+$('sign').onclick = async () => {
+  try {
+    await onMainnet();
+    if (!acct) throw new Error('Connect the admin wallet first');
+    if (acct.toLowerCase() !== st.admin.toLowerCase()) throw new Error('Connected wallet is not the lock admin ' + st.admin);
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 24 * 3600);
+    const typed = {
+      types: {
+        EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+        Withdraw: [{ name: 'lockId', type: 'uint256' }, { name: 'collection', type: 'address' }, { name: 'tokenId', type: 'uint256' }, { name: 'to', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }],
+      },
+      primaryType: 'Withdraw',
+      domain: { name: st.L.name, version: '1', chainId: 1, verifyingContract: st.L.address },
+      message: { lockId: st.lockId.toString(), collection: st.col, tokenId: st.tid.toString(), to: st.depositor, nonce: st.nonce.toString(), deadline: deadline.toString() },
+    };
+    const sig = await ethereum.request({ method: 'eth_signTypedData_v4', params: [acct, JSON.stringify(typed)] });
+    $('approval').value = JSON.stringify({ lock: $('lock').value, lockId: st.lockId.toString(), deadline: deadline.toString(), sig });
+    $('status').innerHTML = '<span class="ok">Approval signed (valid 24h). Now connect the depositor wallet and press Withdraw.</span>';
+  } catch (e) { $('status').innerHTML = `<span class="bad">${e.message || e}</span>`; }
+};
+
+$('withdraw').onclick = async () => {
+  try {
+    await onMainnet();
+    const a = JSON.parse($('approval').value);
+    if (!/^0x[0-9a-fA-F]{130}$/.test(a.sig)) throw new Error('Paste a valid approval first');
+    [acct] = await ethereum.request({ method: 'eth_requestAccounts' }); $('acct').textContent = acct;
+    if (acct.toLowerCase() !== st.depositor.toLowerCase()) throw new Error('Connected wallet is not the depositor ' + st.depositor);
+    // withdraw(uint256 lockId, uint256 deadline, bytes adminSig) — hand-encoded (no libraries).
+    const sig = a.sig.replace(/^0x/, '');
+    const data = '0x744fb6ca' + pad(BigInt(a.lockId).toString(16)) + pad(BigInt(a.deadline).toString(16)) + pad('60') + pad((sig.length / 2).toString(16)) + sig.padEnd(Math.ceil(sig.length / 64) * 64, '0');
+    await ethereum.request({ method: 'eth_call', params: [{ from: acct, to: st.L.address, data }, 'latest'] }); // dry run first
+    const hash = await ethereum.request({ method: 'eth_sendTransaction', params: [{ from: acct, to: st.L.address, data }] });
+    $('status').innerHTML = `Sent: <a class="mono" style="color:var(--gold)" target="_blank" href="https://etherscan.io/tx/${hash}">${hash}</a> — once confirmed the NFT is back in the depositor wallet.`;
+  } catch (e) { $('status').innerHTML = `<span class="bad">${e.message || e}</span> (a dry run failing means the approval is wrong/expired, or the piece isn't in the lock)`; }
+};
+</script>
+</main></body></html>

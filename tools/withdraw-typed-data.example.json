@@ -1,0 +1,33 @@
+{
+  "types": {
+    "EIP712Domain": [
+      { "name": "name", "type": "string" },
+      { "name": "version", "type": "string" },
+      { "name": "chainId", "type": "uint256" },
+      { "name": "verifyingContract", "type": "address" }
+    ],
+    "Withdraw": [
+      { "name": "lockId", "type": "uint256" },
+      { "name": "collection", "type": "address" },
+      { "name": "tokenId", "type": "uint256" },
+      { "name": "to", "type": "address" },
+      { "name": "nonce", "type": "uint256" },
+      { "name": "deadline", "type": "uint256" }
+    ]
+  },
+  "primaryType": "Withdraw",
+  "domain": {
+    "name": "PentagonPrizeLockerOpen",
+    "version": "1",
+    "chainId": 1,
+    "verifyingContract": "0x1AFc17a1B64Cb7095d68CD360e4766f951983aB9"
+  },
+  "message": {
+    "lockId": "4",
+    "collection": "0xc3f733ca98e0dad0386979eb96fb1722a1a05e69",
+    "tokenId": "19015",
+    "to": "0x1D187Aa2832cC7a3F778B075eEd0268744D3017a",
+    "nonce": "0",
+    "deadline": "1790600000"
+  }
+}
