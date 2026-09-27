@@ -74,8 +74,13 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     /// One live listing per prize token: keccak(collection, tokenId) → open dropId (0 = none).
     mapping(bytes32 => uint256) public liveDropOf;
 
+    // ── v5 (append-only; 1 slot taken from __gap) ──
+    /// May post delivery receipts (markFulfilled) in addition to the owner — the keeper, which posts a
+    /// receipt only after its own release has confirmed on Ethereum. 0 = owner only. Owner-set.
+    address public receiptPoster;
+
     // Reserved for future versions' state (append-only upgrades).
-    uint256[36] private __gap;
+    uint256[35] private __gap;
 
     event DropCreated(uint256 indexed dropId, uint64 prizeChainId, address prizeContract, uint256 prizeTokenId, uint256 startPrice, uint64 startTime, uint64 endTime, uint256 redeemPrice);
     event DropRedeemed(uint256 indexed dropId, address indexed redeemer, uint256 amount);
@@ -99,6 +104,7 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     event SellerListed(uint256 indexed dropId, address indexed seller, address collection, uint256 tokenId, uint256 lockId, uint256 price);
     event DeliverTo(uint256 indexed dropId, address indexed deliverTo);
     event SellerPaid(uint256 indexed dropId, address indexed seller, uint256 sellerAmount, uint256 fee);
+    event ReceiptPosterSet(address indexed poster);
     event PriceUpdated(uint256 indexed dropId, uint256 price);
 
     uint256 public constant FEE_BPS = 1000; // 10% to the project on seller listings
@@ -331,7 +337,14 @@ contract PentagonVaultDrops is Initializable, ReentrancyGuard {
     // ─── Fulfill (project delivers prize on the other chain) ───
     /// @notice After delivering the prize NFT to the winner on the prize chain, the owner posts
     ///         the delivery tx hash. Only then does the claim's PC become owner proceeds.
-    function markFulfilled(uint256 dropId, bytes32 prizeTxHash) external onlyOwner nonReentrant {
+    /// Owner sets (or clears, with address(0)) the wallet allowed to post delivery receipts.
+    function setReceiptPoster(address poster) external onlyOwner {
+        receiptPoster = poster;
+        emit ReceiptPosterSet(poster);
+    }
+
+    function markFulfilled(uint256 dropId, bytes32 prizeTxHash) external nonReentrant {
+        require(msg.sender == owner || (msg.sender == receiptPoster && receiptPoster != address(0)), "Not owner");
         Drop storage d = drops[dropId];
         require(d.settledAt != 0, "Not settled");
         require(d.highestBidder != address(0), "No winner");

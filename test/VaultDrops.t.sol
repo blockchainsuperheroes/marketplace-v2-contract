@@ -546,6 +546,75 @@ contract VaultDropsTest is Test {
         vm.prank(seller);
         vd.updatePrice(sid, 4 ether);
     }
+
+    // ── v5: receipt poster (the keeper posts delivery receipts after its own release confirms) ──
+    function _claimed() internal returns (uint256 id) {
+        id = vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 42, 1 ether, 0, 0, 1 ether);
+        vm.prank(alice);
+        vd.redeem{value: 1 ether}(id);
+    }
+
+    function testReceiptPoster_postsReceipt_strangerCannot() public {
+        uint256 id = _claimed();
+        address keeper = makeAddr("keeper");
+        vm.prank(keeper);
+        vm.expectRevert(bytes("Not owner"));
+        vd.markFulfilled(id, bytes32(uint256(1))); // not set yet
+        vd.setReceiptPoster(keeper);
+        assertEq(vd.receiptPoster(), keeper);
+        vm.prank(bob);
+        vm.expectRevert(bytes("Not owner"));
+        vd.markFulfilled(id, bytes32(uint256(1)));
+        vm.prank(keeper);
+        vd.markFulfilled(id, bytes32(uint256(1)));
+        (, , , , , , , , , , bool fulfilled, ) = vd.drops(id);
+        assertTrue(fulfilled);
+        assertEq(vd.proceeds(), 1 ether);
+        vm.prank(keeper);
+        vm.expectRevert(bytes("Already fulfilled"));
+        vd.markFulfilled(id, bytes32(uint256(2)));
+    }
+
+    function testReceiptPoster_ownerAlsoStillPosts() public {
+        uint256 id = _claimed();
+        vd.setReceiptPoster(makeAddr("keeper"));
+        vd.markFulfilled(id, bytes32(uint256(1)));
+        (, , , , , , , , , , bool fulfilled, ) = vd.drops(id);
+        assertTrue(fulfilled);
+    }
+
+    function testReceiptPoster_onlyOwnerSets_andClearing_revokes() public {
+        address keeper = makeAddr("keeper");
+        vm.prank(alice);
+        vm.expectRevert(bytes("Not owner"));
+        vd.setReceiptPoster(alice);
+        vd.setReceiptPoster(keeper);
+        vd.setReceiptPoster(address(0));
+        uint256 id = _claimed();
+        vm.prank(keeper);
+        vm.expectRevert(bytes("Not owner"));
+        vd.markFulfilled(id, bytes32(uint256(1)));
+        // address(0) can never be the poster
+        vm.prank(address(0));
+        vm.expectRevert(bytes("Not owner"));
+        vd.markFulfilled(id, bytes32(uint256(1)));
+    }
+
+    function testReceiptPoster_hasNoOtherOwnerPowers() public {
+        address keeper = makeAddr("keeper");
+        vd.setReceiptPoster(keeper);
+        uint256 id = _claimed();
+        vm.startPrank(keeper);
+        vm.expectRevert(bytes("Not owner"));
+        vd.createDrop(PRIZE_CHAIN, PRIZE_CONTRACT, 43, 1 ether, 0, 0, 1 ether);
+        vm.expectRevert(bytes("Not owner"));
+        vd.refundUndelivered(id);
+        vm.expectRevert(bytes("Not owner"));
+        vd.withdrawProceeds(keeper, 1);
+        vm.expectRevert(bytes("Not owner"));
+        vd.setReceiptPoster(keeper);
+        vm.stopPrank();
+    }
 }
 
 contract HostileSeller {
