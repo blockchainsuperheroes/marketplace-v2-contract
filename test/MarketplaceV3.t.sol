@@ -404,9 +404,55 @@ contract MarketplaceV3Test is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         m.refundOffers(ids);
         vm.prank(owner);
+        vm.expectRevert(Pausable.ExpectedPause.selector); // never on a live book
         m.refundOffers(ids);
+
+        vm.startPrank(owner);
+        m.pause();
+        m.refundOffers(ids);
+        vm.stopPrank();
         assertEq(buyer.balance, 100 ether);
         assertEq(owner.balance, 0);
+    }
+
+    function test_selfTrade_blocked() public {
+        _list(alice, a, 1, 1 ether);
+        vm.deal(alice, 2 ether);
+        vm.expectRevert(PentagonMarketplaceV3.SelfTrade.selector);
+        _buy(alice, a, 1, 1 ether, 1.025 ether);
+
+        a.mint(buyer, 50);
+        vm.prank(buyer);
+        a.setApprovalForAll(address(m), true);
+        uint256 id = _offer(1 ether, 1, bytes32(0));
+        vm.prank(buyer);
+        vm.expectRevert(PentagonMarketplaceV3.SelfTrade.selector);
+        m.acceptOffer(id, _ids(50), new bytes32[][](0));
+    }
+
+    function test_offer_royaltyFrozenWhenPlaced() public {
+        uint256 id = _offer(1 ether, 1, bytes32(0));
+        vm.prank(owner);
+        m.registerRoyalty(address(a), creator, 1000); // registered after the offer was made
+        vm.prank(alice);
+        m.acceptOffer(id, _ids(1), new bytes32[][](0));
+        assertEq(alice.balance, 0.975 ether); // still the 2.5% from when the offer was placed
+        assertEq(creator.balance, 0.025 ether); // paid to the current receiver
+    }
+
+    // Root and proof made by the OpenZeppelin merkle-tree JS library (npm, v1.0.8):
+    // StandardMerkleTree.of([[2],[3],[5],[11],[4096]], ["uint256"]), proof for 5.
+    function test_traitOffer_acceptsProofFromTheJsLibrary() public {
+        bytes32 root = 0x48e727200e32f97cee765fffd123e26b7f91632b78e44a153e94a3a6acdad0d1;
+        uint256 id = _offer(1 ether, 1, root);
+        bytes32[][] memory proofs = new bytes32[][](1);
+        proofs[0] = new bytes32[](3);
+        proofs[0][0] = 0x1ab0c6948a275349ae45a06aad66a8bd65ac18074615d53676c09b67809099e0;
+        proofs[0][1] = 0xb2ac7d4e10f072d9f46be3db644ef1be450423557f8fa8d52ccc7cf0d7e8c319;
+        proofs[0][2] = 0x597237c1d6e24e6a10ee1ffad0cc6b409d893b4096f12a57709bba26074862d6;
+        vm.prank(alice);
+        m.acceptOffer(id, _ids(5), proofs);
+        assertEq(a.ownerOf(5), buyer);
     }
 
     // ───────── payouts & pause ─────────

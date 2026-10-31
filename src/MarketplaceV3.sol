@@ -13,17 +13,21 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// is held here until filled or cancelled.
 ///
 /// Rules, in one place:
-/// - Fee: buyer side only, frozen into each listing / offer when it is made, hard-capped at 5%.
-/// - Royalty: our registry only. A collection's own ERC-2981 is ignored. Collections nobody has
-///   registered pay the default royalty to the floor fund. Capped at 10%, frozen into listings.
+/// - Fee: buyer side only, hard-capped at 5%. Royalty: our registry only; a collection's own ERC-2981
+///   is ignored. Collections nobody has registered pay the default royalty to the floor fund. Capped
+///   at 10%. Both rates are frozen into each listing / offer when it is made.
+/// - The off-chain PC rebate is only safe while fee + royalty costs a wash trader more than the
+///   rebate returns, so the default royalty is part of that safety argument: re-check the rebate
+///   before lowering it or the fee (docs/REBATE-DESIGN.md).
+/// - Nobody can buy their own listing or fill their own offer.
 /// - A listing is live only while the seller still owns the NFT, it has not expired (max 180 days)
 ///   and the seller has not bumped their nonce (cancel-all). Every sale deletes it; anyone may clear
 ///   a listing that is no longer live, so it can never come back at an old price.
 /// - Offers name one collection and are only filled with that collection's tokens. An offer may
 ///   restrict which tokens fill it with a Merkle root of token ids (trait offers, single-item offers).
 /// - Payouts are pushed with a gas limit; if a receiver rejects them they are kept for withdraw().
-/// - Owner powers: fee, royalties, treasury / floor fund, which collections trade, pause, and
-///   refunding offers to their bidders. The owner can never move anyone's NFT or money elsewhere.
+/// - Owner powers: fee, royalties, treasury / floor fund, which collections trade, pause, and, while
+///   paused, refunding offers to their bidders. The owner can never move anyone's NFT or money elsewhere.
 contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public constant MAX_FEE_BPS = 500;
     uint256 public constant MAX_ROYALTY_BPS = 1000;
@@ -45,7 +49,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         address collection;
         uint40 expiry;
         uint16 feeBps;
-        uint32 remaining;
+        uint16 royaltyBps;
+        uint16 remaining;
         bytes32 tokensRoot; // 0 = any token of the collection
     }
 
@@ -106,6 +111,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error OfferNotLive();
     error NotBidder();
     error TokenNotInOffer();
+    error SelfTrade();
     error BpsTooHigh();
     error ZeroAddress();
     error NothingToWithdraw();
@@ -178,6 +184,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
             BuyItem calldata it = items[i];
             Listing memory l = listings[it.collection][it.tokenId];
             if (l.seller == address(0)) revert NotListed();
+            if (l.seller == msg.sender) revert SelfTrade();
             if (!collectionAllowed[it.collection]) revert CollectionNotAllowed();
             if (l.expiry < block.timestamp || l.nonce != sellerNonce[l.seller]) revert ListingNotLive();
             if (l.price > it.maxPrice) revert PriceAboveMax();
@@ -204,12 +211,14 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     {
         if (!collectionAllowed[collection]) revert CollectionNotAllowed();
         if (price == 0 || price > type(uint96).max) revert BadPrice();
-        if (quantity == 0 || quantity > type(uint32).max) revert BadQuantity();
+        if (quantity == 0 || quantity > type(uint16).max) revert BadQuantity();
         if (expiry <= block.timestamp || expiry > block.timestamp + MAX_DURATION) revert BadExpiry();
         uint256 fee = (price * feeBps) / 10_000;
         if (msg.value != (price + fee) * quantity) revert WrongPayment();
         offerId = ++offerCount;
-        offers[offerId] = Offer(msg.sender, uint96(price), collection, uint40(expiry), feeBps, uint32(quantity), tokensRoot);
+        offers[offerId] = Offer(
+            msg.sender, uint96(price), collection, uint40(expiry), feeBps, _royaltyBps(collection), uint16(quantity), tokensRoot
+        );
         emit OfferPlaced(offerId, msg.sender, collection, price, quantity, expiry, feeBps, tokensRoot);
     }
 
@@ -223,16 +232,17 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         Offer storage o = offers[offerId];
         address collection = o.collection;
         if (o.bidder == address(0) || o.expiry < block.timestamp) revert OfferNotLive();
+        if (o.bidder == msg.sender) revert SelfTrade();
         if (!collectionAllowed[collection]) revert CollectionNotAllowed();
         if (tokenIds.length == 0 || tokenIds.length > o.remaining) revert BadQuantity();
         if (o.tokensRoot != bytes32(0) && proofs.length != tokenIds.length) revert LengthMismatch();
-        o.remaining -= uint32(tokenIds.length);
+        o.remaining -= uint16(tokenIds.length);
 
         address bidder = o.bidder;
         uint256 price = o.price;
         uint256 fee = (price * o.feeBps) / 10_000;
         bytes32 root = o.tokensRoot;
-        uint16 royaltyBps = _royaltyBps(collection);
+        uint16 royaltyBps = o.royaltyBps;
         if (o.remaining == 0) delete offers[offerId];
 
         for (uint256 i; i < tokenIds.length; ++i) {
@@ -251,8 +261,9 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         _closeOffer(offerId);
     }
 
-    /// Refund offers to their own bidders (e.g. when retiring this contract). Money only goes back to the bidder.
-    function refundOffers(uint256[] calldata offerIds) external onlyOwner nonReentrant {
+    /// Refund offers to their own bidders when winding down. Only while paused, so the owner can never
+    /// clear competing offers off a live book. Money only goes back to the bidder.
+    function refundOffers(uint256[] calldata offerIds) external onlyOwner whenPaused nonReentrant {
         for (uint256 i; i < offerIds.length; ++i) {
             if (offers[offerIds[i]].bidder != address(0)) _closeOffer(offerIds[i]);
         }

@@ -11,6 +11,20 @@ This file collects the design so far: nftprof's decisions (2026-10-31) and the B
 - **No rebate** when the NFT returns to an owner it had in the previous 7 days.
 - **Caps are in PC, not ETH:** a per-wallet daily cap, so a manipulated rate can't raise the payout past it.
 
+## Wash-trade arithmetic (the safety argument)
+
+A self-dealt sale costs `fee + royalty` and earns `rebate`. The rebate is only safe while
+`fee + royalty > rebate`. Today that is 2.5% + 2.5% > 2%.
+
+- **Registered creator washing their own collection:** the royalty goes back to them, so it costs only the 2.5% fee. They pay 0.5% net in ETH and receive 2% in PC, about a 75% discount on PC, repeatable at any size.
+- **Chained wash trades** (A→B→C→D, each pair new, so nothing returns) slip past both the 7-day rule and per-wallet caps, because addresses are free.
+
+Mitigations:
+- **Rebate only for registered PG members.** This resists fake identities; address-based caps can't.
+- **No rebate when the collection's royalty receiver is the buyer or the seller.**
+- **The contract rejects self-buy and self-fill** (`SelfTrade`).
+- **`defaultRoyaltyBps` is part of this argument.** Lowering it or the fee below the rebate opens a money pump. Re-run this check before changing either.
+
 ## Rails
 
 The Redeem store accepts both, so the rebate can use either.
