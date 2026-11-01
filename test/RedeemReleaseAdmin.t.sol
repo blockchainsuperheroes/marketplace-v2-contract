@@ -148,6 +148,27 @@ contract RedeemReleaseAdminTest is Test {
         assertEq(nft.ownerOf(1), winner);
     }
 
+    function test_veto_blocksAutoForThatLockOnly() public {
+        vm.prank(winner);
+        vm.expectRevert(RedeemReleaseAdmin.NotHuman.selector);
+        ra.setVetoed(address(open), lockId, true);
+        vm.prank(human);
+        ra.setVetoed(address(open), lockId, true);
+
+        uint256 dl = block.timestamp + 1 hours;
+        bytes memory s1 = _autoSig(address(open), lockId, winner, dl, VERIFIER_PK);
+        bytes memory s2 = _autoSig(address(open), lockId + 1, winner, dl, VERIFIER_PK);
+        bytes memory manual = _sign(HUMAN_PK, open.releaseDigest(lockId, winner, dl));
+        vm.startPrank(keeper);
+        vm.expectRevert(PentagonPrizeLockerOpen.BadAdminSig.selector);
+        open.release(lockId, winner, dl, s1);
+        open.release(lockId + 1, winner, dl, s2); // other locks unaffected
+        open.release(lockId, winner, dl, manual); // human can still release it
+        vm.stopPrank();
+        assertEq(nft.ownerOf(1), winner);
+        assertEq(nft.ownerOf(2), winner);
+    }
+
     function test_human_keepsEveryAdminPower() public {
         uint256 dl = block.timestamp + 1 hours;
         bytes memory w = _sign(HUMAN_PK, open.withdrawDigest(lockId, dl));

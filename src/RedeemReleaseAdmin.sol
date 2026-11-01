@@ -21,8 +21,9 @@ interface IReleaseDigest {
 ///         The verifier signs only after re-reading the claim itself: paid in PC at the listed price,
 ///         unreleased 72h after the claim, delivery address a plain wallet. Off-chain rules; on-chain we
 ///         additionally refuse a recipient that has code here.
-///         `human` can switch AUTO off instantly. Changing the verifier means deploying a new admin and
-///         a public 48h role change on each locker.
+///         `human` can switch AUTO off instantly, or veto it for one lock (the 72h wait is the window to
+///         do so). Nothing about this contract can change except those two switches: changing the
+///         verifier means deploying a new admin and a public 48h role change on each locker.
 contract RedeemReleaseAdmin is IERC1271, EIP712 {
     bytes4 private constant MAGIC = IERC1271.isValidSignature.selector;
     bytes4 private constant INVALID = 0xffffffff;
@@ -33,8 +34,11 @@ contract RedeemReleaseAdmin is IERC1271, EIP712 {
     address public immutable lockerA;
     address public immutable lockerB;
     bool public autoPaused;
+    /// locker => lockId => auto release vetoed by `human`
+    mapping(address => mapping(uint256 => bool)) public vetoed;
 
     event AutoPaused(bool paused);
+    event Vetoed(address indexed locker, uint256 indexed lockId, bool vetoed);
 
     error NotHuman();
     error ZeroAddress();
@@ -57,7 +61,7 @@ contract RedeemReleaseAdmin is IERC1271, EIP712 {
         if (autoPaused || (locker != lockerA && locker != lockerB)) return INVALID;
         (uint256 lockId, address to, uint256 deadline, bytes memory verifierSig) =
             abi.decode(signature, (uint256, address, uint256, bytes));
-        if (to.code.length != 0) return INVALID;
+        if (vetoed[locker][lockId] || to.code.length != 0) return INVALID;
         if (IReleaseDigest(locker).releaseDigest(lockId, to, deadline) != hash) return INVALID;
         return _signer(autoReleaseDigest(locker, hash), verifierSig) == verifier ? MAGIC : INVALID;
     }
@@ -71,6 +75,12 @@ contract RedeemReleaseAdmin is IERC1271, EIP712 {
         if (msg.sender != human) revert NotHuman();
         autoPaused = paused;
         emit AutoPaused(paused);
+    }
+
+    function setVetoed(address locker, uint256 lockId, bool veto) external {
+        if (msg.sender != human) revert NotHuman();
+        vetoed[locker][lockId] = veto;
+        emit Vetoed(locker, lockId, veto);
     }
 
     function _signer(bytes32 digest, bytes memory sig) internal pure returns (address signer) {
