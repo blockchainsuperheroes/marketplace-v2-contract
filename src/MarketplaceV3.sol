@@ -7,6 +7,10 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
+interface IOwnableCollection {
+    function owner() external view returns (address);
+}
+
 /// @title Pentagon Marketplace V3
 /// @notice Fixed-price listings and escrowed offers for ERC-721, paid in the chain's native coin
 /// (ETH on Ethereum, PC on Pentagon). NFTs never leave the seller's wallet until a sale; offer money
@@ -16,6 +20,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// - Fee: buyer side only, hard-capped at 5%. Royalty: our registry only; a collection's own ERC-2981
 ///   is ignored. Collections nobody has registered pay the default royalty to the floor fund. Capped
 ///   at 10%. Both rates are frozen into each listing / offer when it is made.
+/// - Who registers a royalty: the collection's own owner() (self-serve, on our site), or our owner.
+///   Our owner can override any registration and block self-serve for a collection (disputes,
+///   renounced or wrong owner()).
 /// - The off-chain PC rebate is only safe while fee + royalty costs a wash trader more than the
 ///   rebate returns, so the default royalty is part of that safety argument: re-check the rebate
 ///   before lowering it or the fee (docs/REBATE-DESIGN.md).
@@ -72,6 +79,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public offerCount;
     mapping(address => Royalty) public registeredRoyalty;
     mapping(address => uint256) public pendingPayouts;
+    mapping(address => bool) public selfServeBlocked;
 
     address public treasury;
     address public floorFund;
@@ -90,7 +98,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event Withdrawn(address indexed to, uint256 amount);
     event CollectionAllowed(address indexed collection, bool allowed);
     event FeeSet(uint256 bps);
-    event RoyaltyRegistered(address indexed collection, address receiver, uint256 bps);
+    event RoyaltyRegistered(address indexed collection, address receiver, uint256 bps, address indexed by);
+    event SelfServeBlocked(address indexed collection, bool blocked);
     event DefaultRoyaltySet(uint256 bps);
     event TreasurySet(address treasury);
     event FloorFundSet(address floorFund);
@@ -114,6 +123,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error SelfTrade();
     error BpsTooHigh();
     error ZeroAddress();
+    error NotCollectionOwner();
+    error SelfServeIsBlocked();
     error NothingToWithdraw();
     error WithdrawFailed();
 
@@ -303,10 +314,30 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     /// Register a creator's royalty (after they have proved control of the collection to us).
     /// receiver = 0 removes the registration, sending royalties back to the floor fund.
     function registerRoyalty(address collection, address receiver, uint16 bps) external onlyOwner {
-        if (bps > MAX_ROYALTY_BPS) revert BpsTooHigh();
-        if (receiver == address(0)) delete registeredRoyalty[collection];
-        else registeredRoyalty[collection] = Royalty(receiver, bps);
-        emit RoyaltyRegistered(collection, receiver, receiver == address(0) ? 0 : bps);
+        _registerRoyalty(collection, receiver, bps);
+    }
+
+    /// Self-serve: the wallet the collection contract names as its owner() sets the collection's
+    /// royalty. receiver = 0 removes it (royalties go back to the floor fund).
+    function registerRoyaltyAsCreator(address collection, address receiver, uint16 bps) external {
+        if (selfServeBlocked[collection]) revert SelfServeIsBlocked();
+        if (collectionOwner(collection) != msg.sender) revert NotCollectionOwner();
+        _registerRoyalty(collection, receiver, bps);
+    }
+
+    /// Stop (or allow again) self-serve for a collection whose owner() can't be trusted.
+    function setSelfServeBlocked(address collection, bool blocked) external onlyOwner {
+        selfServeBlocked[collection] = blocked;
+        emit SelfServeBlocked(collection, blocked);
+    }
+
+    /// The collection contract's owner(), or 0 if it has none.
+    function collectionOwner(address collection) public view returns (address) {
+        try IOwnableCollection(collection).owner() returns (address o) {
+            return o;
+        } catch {
+            return address(0);
+        }
     }
 
     function setDefaultRoyalty(uint16 bps) external onlyOwner {
@@ -397,6 +428,13 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     function _royaltyBps(address collection) internal view returns (uint16) {
         Royalty memory r = registeredRoyalty[collection];
         return r.receiver != address(0) ? r.bps : defaultRoyaltyBps;
+    }
+
+    function _registerRoyalty(address collection, address receiver, uint16 bps) internal {
+        if (bps > MAX_ROYALTY_BPS) revert BpsTooHigh();
+        if (receiver == address(0)) delete registeredRoyalty[collection];
+        else registeredRoyalty[collection] = Royalty(receiver, bps);
+        emit RoyaltyRegistered(collection, receiver, receiver == address(0) ? 0 : bps, msg.sender);
     }
 
     function _setFee(uint16 bps) internal {

@@ -12,6 +12,12 @@ contract MockNFT is ERC721 {
     function mint(address to, uint256 id) external { _mint(to, id); }
 }
 
+contract OwnedNFT is ERC721 {
+    address public owner;
+    constructor(address o) ERC721("O", "O") { owner = o; }
+    function mint(address to, uint256 id) external { _mint(to, id); }
+}
+
 /// A seller wallet that rejects payments until told to accept them (e.g. a smart wallet with no receive()).
 contract PickySeller {
     bool public accept;
@@ -268,6 +274,65 @@ contract MarketplaceV3Test is Test {
         assertEq(r, floorFund);
         assertEq(bps, 250);
         assertFalse(registered);
+    }
+
+    function test_creatorSelfServe_setsOwnRoyalty() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        assertEq(m.collectionOwner(address(c)), creator);
+
+        vm.prank(alice); // not the collection's owner()
+        vm.expectRevert(PentagonMarketplaceV3.NotCollectionOwner.selector);
+        m.registerRoyaltyAsCreator(address(c), alice, 500);
+
+        vm.prank(creator);
+        vm.expectRevert(PentagonMarketplaceV3.BpsTooHigh.selector);
+        m.registerRoyaltyAsCreator(address(c), creator, 1001);
+
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 500);
+        (address r, uint256 bps, bool registered) = m.royaltyFor(address(c));
+        assertEq(r, creator);
+        assertEq(bps, 500);
+        assertTrue(registered);
+
+        c.mint(alice, 1);
+        vm.prank(alice);
+        c.setApprovalForAll(address(m), true);
+        _list(alice, MockNFT(address(c)), 1, 1 ether);
+        _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
+        assertEq(creator.balance, 0.05 ether);
+    }
+
+    function test_creatorSelfServe_ownerCanOverrideAndBlock() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 1000);
+
+        vm.startPrank(owner);
+        m.registerRoyalty(address(c), carol, 300); // our override wins
+        m.setSelfServeBlocked(address(c), true);
+        vm.stopPrank();
+        (address r, uint256 bps,) = m.royaltyFor(address(c));
+        assertEq(r, carol);
+        assertEq(bps, 300);
+
+        vm.prank(creator);
+        vm.expectRevert(PentagonMarketplaceV3.SelfServeIsBlocked.selector);
+        m.registerRoyaltyAsCreator(address(c), creator, 1000);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        m.setSelfServeBlocked(address(c), false);
+    }
+
+    function test_creatorSelfServe_impossibleWithoutOwnerFunction() public {
+        // MockNFT has no owner(): nobody can self-register; only our owner can.
+        assertEq(m.collectionOwner(address(a)), address(0));
+        vm.prank(alice);
+        vm.expectRevert(PentagonMarketplaceV3.NotCollectionOwner.selector);
+        m.registerRoyaltyAsCreator(address(a), alice, 500);
     }
 
     function test_adminFunctions_onlyOwner() public {
