@@ -18,8 +18,11 @@ interface IOwnableCollection {
 ///
 /// Rules, in one place:
 /// - Fee: buyer side only, hard-capped at 5%. Royalty: our registry only; a collection's own ERC-2981
-///   is ignored. Collections nobody has registered pay the default royalty to the floor fund. Capped
-///   at 10%. Both rates are frozen into each listing / offer when it is made.
+///   is ignored. Capped at 10%. Both rates are frozen into each listing / offer when it is made.
+/// - Floor fund: collections nobody has registered pay the default royalty into a balance HELD HERE per
+///   collection (floorFundOf). Our owner withdraws it (to buy that collection's floor NFTs for Redeem).
+///   Once the collection is registered, its owner() wallet may withdraw it too. Either way it can only
+///   go to our owner or to the collection's owner().
 /// - Who registers a royalty: the collection's own owner() (self-serve, on our site), or our owner.
 ///   Our owner can override any registration and block self-serve for a collection (disputes,
 ///   renounced or wrong owner()).
@@ -33,7 +36,7 @@ interface IOwnableCollection {
 /// - Offers name one collection and are only filled with that collection's tokens. An offer may
 ///   restrict which tokens fill it with a Merkle root of token ids (trait offers, single-item offers).
 /// - Payouts are pushed with a gas limit; if a receiver rejects them they are kept for withdraw().
-/// - Owner powers: fee, royalties, treasury / floor fund, which collections trade, pause / unpause,
+/// - Owner powers: fee, royalties, treasury, floor-fund withdrawals (above), which collections trade, pause / unpause,
 ///   naming a guardian (a hot key that can only pause), and, while paused, refunding offers to their
 ///   bidders. The owner can never move anyone's NFT or money elsewhere.
 contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
@@ -81,9 +84,10 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => Royalty) public registeredRoyalty;
     mapping(address => uint256) public pendingPayouts;
     mapping(address => bool) public selfServeBlocked;
+    /// Unregistered royalties held per collection (see the header).
+    mapping(address => uint256) public floorFundOf;
 
     address public treasury;
-    address public floorFund;
     address public guardian; // may pause (never unpause); 0 = owner only
     uint16 public feeBps;
     uint16 public defaultRoyaltyBps;
@@ -104,7 +108,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event SelfServeBlocked(address indexed collection, bool blocked);
     event DefaultRoyaltySet(uint256 bps);
     event TreasurySet(address treasury);
-    event FloorFundSet(address floorFund);
+    event FloorFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
     event GuardianSet(address guardian);
 
     error CollectionNotAllowed();
@@ -131,12 +135,14 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error NothingToWithdraw();
     error WithdrawFailed();
     error NotGuardian();
+    error NotAllowedToWithdraw();
+    error BadRecipient();
+    error AmountTooHigh();
 
-    constructor(address owner_, address treasury_, address floorFund_, uint16 feeBps_, uint16 defaultRoyaltyBps_)
+    constructor(address owner_, address treasury_, uint16 feeBps_, uint16 defaultRoyaltyBps_)
         Ownable(owner_)
     {
         _setTreasury(treasury_);
-        _setFloorFund(floorFund_);
         _setFee(feeBps_);
         _setDefaultRoyalty(defaultRoyaltyBps_);
     }
@@ -301,7 +307,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     function royaltyFor(address collection) public view returns (address receiver, uint256 bps, bool registered) {
         Royalty memory r = registeredRoyalty[collection];
         if (r.receiver != address(0)) return (r.receiver, r.bps, true);
-        return (floorFund, defaultRoyaltyBps, false);
+        return (address(this), defaultRoyaltyBps, false); // held in floorFundOf[collection]
     }
 
     // ───────────────────────────── Admin ─────────────────────────────
@@ -317,13 +323,13 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// Register a creator's royalty (after they have proved control of the collection to us).
-    /// receiver = 0 removes the registration, sending royalties back to the floor fund.
+    /// receiver = 0 removes the registration; royalties go back into the collection's floor fund.
     function registerRoyalty(address collection, address receiver, uint16 bps) external onlyOwner {
         _registerRoyalty(collection, receiver, bps);
     }
 
     /// Self-serve: the wallet the collection contract names as its owner() sets the collection's
-    /// royalty. receiver = 0 removes it (royalties go back to the floor fund).
+    /// royalty. receiver = 0 removes it (royalties go back into the collection's floor fund).
     function registerRoyaltyAsCreator(address collection, address receiver, uint16 bps) external {
         if (selfServeBlocked[collection]) revert SelfServeIsBlocked();
         if (collectionOwner(collection) != msg.sender) revert NotCollectionOwner();
@@ -353,8 +359,20 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         _setTreasury(treasury_);
     }
 
-    function setFloorFund(address floorFund_) external onlyOwner {
-        _setFloorFund(floorFund_);
+    /// Withdraw a collection's floor fund. Callers: our owner always; the collection's owner() wallet
+    /// once the collection has a registered royalty (and self-serve isn't blocked). Recipient: our
+    /// owner or the collection's owner(), nobody else.
+    function withdrawFloorFund(address collection, address to, uint256 amount) external nonReentrant {
+        address cOwner = collectionOwner(collection);
+        bool creator = cOwner != address(0) && msg.sender == cOwner
+            && registeredRoyalty[collection].receiver != address(0) && !selfServeBlocked[collection];
+        if (msg.sender != owner() && !creator) revert NotAllowedToWithdraw();
+        if (to != owner() && (cOwner == address(0) || to != cOwner)) revert BadRecipient();
+        if (amount == 0 || amount > floorFundOf[collection]) revert AmountTooHigh();
+        floorFundOf[collection] -= amount;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit FloorFundWithdrawn(collection, to, amount, msg.sender);
     }
 
     /// The owner or the guardian (a hot key for emergencies) can pause; only the owner can unpause.
@@ -411,7 +429,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 royalty = (price * royaltyBps) / 10_000;
         if (fee > 0) _pay(treasury, fee);
         if (royalty > 0) {
-            _pay(receiver, royalty);
+            if (registered) _pay(receiver, royalty);
+            else floorFundOf[collection] += royalty;
             emit RoyaltyPaid(collection, tokenId, receiver, royalty, registered);
         }
         _pay(seller, price - royalty);
@@ -480,11 +499,5 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         if (t == address(0)) revert ZeroAddress();
         treasury = t;
         emit TreasurySet(t);
-    }
-
-    function _setFloorFund(address f) internal {
-        if (f == address(0)) revert ZeroAddress();
-        floorFund = f;
-        emit FloorFundSet(f);
     }
 }

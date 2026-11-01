@@ -5,9 +5,10 @@ A professional audit comes before third-party collections are allowed.
 
 ## Decide before deploying (nftprof)
 
-- [ ] **Treasury wallet**: where the 2.5% buyer fee goes.
-- [ ] **Floor-fund wallet**: where unregistered collections' 2.5% royalty goes.
-  - Keep it a separate wallet from the treasury, so the floor buys can be accounted for.
+- [x] **Treasury wallet**: 0xB2e3 (nftprof, 2026-11-01).
+- [x] Floor fund: no wallet. Unregistered collections' 2.5% royalty is held in the contract per
+  collection (`floorFundOf`). 0xB2e3 withdraws it (to itself or the collection's owner()); once a
+  collection is registered, its owner() wallet can withdraw it too.
 - [ ] **Launch collections**: our own Ethereum collections only. List the contract addresses.
 - [ ] **Creator royalties for those collections**: receiver and bps (≤ 1000).
   - Or leave them unregistered, so their royalty goes to the floor fund.
@@ -17,7 +18,7 @@ A professional audit comes before third-party collections are allowed.
 ## Deploy
 
 ```bash
-TREASURY=0x… FLOOR_FUND=0x… COLLECTIONS=0x…,0x… \
+TREASURY=0x… COLLECTIONS=0x…,0x… \
 ROYALTY_COLLECTIONS=0x… ROYALTY_RECEIVERS=0x… ROYALTY_BPS_LIST=500 \
 forge script script/DeployMarketplaceV3.s.sol --rpc-url $ETH_RPC --broadcast --verify \
   --private-key-file <throwaway key file>   # or --ledger
@@ -32,7 +33,7 @@ forge script script/DeployMarketplaceV3.s.sol --rpc-url $ETH_RPC --broadcast --v
 2. Check on Etherscan:
    - `owner()` is 0xB2e3 and `pendingOwner()` is 0;
    - `feeBps()` is 250 and `defaultRoyaltyBps()` is 250;
-   - `treasury()` and `floorFund()` are right;
+   - `treasury()` is right and `guardian()` is 0 (the role exists, unassigned);
    - `collectionAllowed()` is true for each launch collection;
    - `royaltyFor()` is right for each.
 3. Smoke test with one cheap NFT of ours:

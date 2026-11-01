@@ -40,7 +40,6 @@ contract MarketplaceV3Test is Test {
     MockNFT b;
     address owner = makeAddr("owner");
     address treasury = makeAddr("treasury");
-    address floorFund = makeAddr("floorFund");
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
     address carol = makeAddr("carol");
@@ -48,7 +47,7 @@ contract MarketplaceV3Test is Test {
     address creator = makeAddr("creator");
 
     function setUp() public {
-        m = new PentagonMarketplaceV3(owner, treasury, floorFund, 250, 250);
+        m = new PentagonMarketplaceV3(owner, treasury, 250, 250);
         a = new MockNFT("A");
         b = new MockNFT("B");
         vm.startPrank(owner);
@@ -105,7 +104,7 @@ contract MarketplaceV3Test is Test {
         assertEq(a.ownerOf(1), buyer);
         assertEq(alice.balance, 0.975 ether); // price − 2.5% royalty; seller pays no fee
         assertEq(treasury.balance, 0.025 ether); // 2.5% buyer fee
-        assertEq(floorFund.balance, 0.025 ether); // unregistered collection → floor fund
+        assertEq(m.floorFundOf(address(a)), 0.025 ether); // unregistered collection → floor fund
         assertEq(buyer.balance, 100 ether - 1.025 ether);
         (address seller,,,,,) = m.listings(address(a), 1);
         assertEq(seller, address(0));
@@ -233,12 +232,12 @@ contract MarketplaceV3Test is Test {
         vm.stopPrank();
         _buy(buyer, a, 1, 1 ether, 1.025 ether); // still 2.5% fee
         assertEq(treasury.balance, 0.025 ether);
-        assertEq(floorFund.balance, 0.025 ether); // still 2.5% royalty
+        assertEq(m.floorFundOf(address(a)), 0.025 ether); // still 2.5% royalty
 
         _list(alice, a, 2, 1 ether); // new listing takes the new rates
         _buy(buyer, a, 2, 1 ether, 1.05 ether);
         assertEq(treasury.balance, 0.075 ether);
-        assertEq(floorFund.balance, 0.125 ether);
+        assertEq(m.floorFundOf(address(a)), 0.125 ether);
     }
 
     function test_caps() public {
@@ -251,7 +250,7 @@ contract MarketplaceV3Test is Test {
         m.registerRoyalty(address(a), creator, 1001);
         vm.stopPrank();
         vm.expectRevert(PentagonMarketplaceV3.BpsTooHigh.selector);
-        new PentagonMarketplaceV3(owner, treasury, floorFund, 501, 250);
+        new PentagonMarketplaceV3(owner, treasury, 501, 250);
     }
 
     function test_registeredCreator_getsRoyalty_andCollectionErc2981IsIgnored() public {
@@ -265,13 +264,13 @@ contract MarketplaceV3Test is Test {
         _list(alice, a, 1, 1 ether);
         _buy(buyer, a, 1, 1 ether, 1.025 ether);
         assertEq(creator.balance, 0.05 ether);
-        assertEq(floorFund.balance, 0);
+        assertEq(m.floorFundOf(address(a)), 0);
         assertEq(alice.balance, 0.95 ether);
 
         vm.prank(owner);
         m.registerRoyalty(address(a), address(0), 0); // unregister → back to floor fund at default
         (r, bps, registered) = m.royaltyFor(address(a));
-        assertEq(r, floorFund);
+        assertEq(r, address(m)); // held in the contract per collection
         assertEq(bps, 250);
         assertFalse(registered);
     }
@@ -352,6 +351,71 @@ contract MarketplaceV3Test is Test {
         vm.stopPrank();
     }
 
+    function test_floorFund_heldPerCollection_onlyOwnerBeforeRegistration() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        c.mint(alice, 1);
+        vm.prank(alice);
+        c.setApprovalForAll(address(m), true);
+        _list(alice, MockNFT(address(c)), 1, 1 ether);
+        _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
+        assertEq(m.floorFundOf(address(c)), 0.025 ether);
+        assertEq(address(m).balance, 0.025 ether);
+
+        vm.prank(creator); // not registered yet: the collection owner can't withdraw
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawFloorFund(address(c), creator, 0.01 ether);
+
+        vm.startPrank(owner);
+        vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector); // only to us or the collection owner
+        m.withdrawFloorFund(address(c), carol, 0.01 ether);
+        vm.expectRevert(PentagonMarketplaceV3.AmountTooHigh.selector);
+        m.withdrawFloorFund(address(c), owner, 1 ether);
+        m.withdrawFloorFund(address(c), owner, 0.01 ether); // to us (to buy floor NFTs)
+        m.withdrawFloorFund(address(c), creator, 0.005 ether); // or on the creator's behalf
+        vm.stopPrank();
+        assertEq(owner.balance, 0.01 ether);
+        assertEq(creator.balance, 0.005 ether);
+        assertEq(m.floorFundOf(address(c)), 0.01 ether);
+    }
+
+    function test_floorFund_creatorCanWithdrawOnceRegistered_toOwnerAddressesOnly() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        c.mint(alice, 1);
+        vm.prank(alice);
+        c.setApprovalForAll(address(m), true);
+        _list(alice, MockNFT(address(c)), 1, 1 ether);
+        _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
+
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 500);
+        vm.prank(creator);
+        vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector);
+        m.withdrawFloorFund(address(c), carol, 0.025 ether);
+        vm.prank(creator);
+        m.withdrawFloorFund(address(c), creator, 0.025 ether);
+        assertEq(creator.balance, 0.025 ether);
+        assertEq(m.floorFundOf(address(c)), 0);
+
+        vm.prank(alice); // strangers never
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawFloorFund(address(c), owner, 0);
+    }
+
+    function test_floorFund_blockedSelfServe_stopsCreatorWithdrawals() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 500);
+        vm.prank(owner);
+        m.setSelfServeBlocked(address(c), true);
+        vm.prank(creator);
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawFloorFund(address(c), creator, 1);
+    }
+
     function test_guardian_canPauseButNotUnpause() public {
         address g = makeAddr("guardian");
         vm.prank(owner);
@@ -381,7 +445,7 @@ contract MarketplaceV3Test is Test {
         vm.prank(creator);
         m.registerRoyaltyAsCreator(address(c), address(0), 0); // removed: back to the 2.5% default
         _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-        assertEq(floorFund.balance, 0.025 ether); // not the frozen 10%
+        assertEq(m.floorFundOf(address(c)), 0.025 ether); // not the frozen 10%
         assertEq(alice.balance, 0.975 ether);
     }
 
@@ -448,14 +512,14 @@ contract MarketplaceV3Test is Test {
         assertEq(a.ownerOf(3), buyer);
         assertEq(alice.balance, 0.975 ether);
         assertEq(treasury.balance, 0.025 ether);
-        assertEq(floorFund.balance, 0.025 ether);
-        assertEq(address(m).balance, 1.025 ether); // one fill left
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
+        assertEq(address(m).balance, 1.025 ether + 0.025 ether); // one fill left + the floor fund
 
         uint256 before = buyer.balance;
         vm.prank(buyer);
         m.cancelOffer(id);
         assertEq(buyer.balance, before + 1.025 ether);
-        assertEq(address(m).balance, 0);
+        assertEq(address(m).balance, 0.025 ether); // only the floor fund is left
     }
 
     function test_offer_cannotOverfill() public {
