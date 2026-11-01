@@ -21,7 +21,8 @@ interface IReleaseDigest {
 ///         The verifier signs only after re-reading the claim itself: paid in PC at the listed price,
 ///         unreleased 72h after the claim, delivery address a plain wallet. Off-chain rules; on-chain we
 ///         additionally refuse a recipient that has code here.
-///         `human` can switch AUTO off instantly, or veto it for one lock (the 72h wait is the window to
+///         Signatures can't outlive 48h: the lockers check `deadline` (≤ now + 48h) BEFORE asking us.
+///         AUTO starts switched off; `human` arms it after the handover, can switch it off instantly, or veto it for one lock (the 72h wait is the window to
 ///         do so). Nothing about this contract can change except those two switches: changing the
 ///         verifier means deploying a new admin and a public 48h role change on each locker.
 contract RedeemReleaseAdmin is IERC1271, EIP712 {
@@ -46,11 +47,16 @@ contract RedeemReleaseAdmin is IERC1271, EIP712 {
     constructor(address human_, address verifier_, address lockerA_, address lockerB_)
         EIP712("PentagonRedeemRelease", "1")
     {
-        if (human_ == address(0) || verifier_ == address(0) || lockerA_ == address(0)) revert ZeroAddress();
+        if (human_ == address(0) || verifier_ == address(0) || lockerA_ == address(0) || lockerB_ == address(0)) {
+            revert ZeroAddress();
+        }
         human = human_;
         verifier = verifier_;
         lockerA = lockerA_;
         lockerB = lockerB_;
+        // Deployed disarmed: AUTO stays off until `human` has checked the handover and arms it.
+        autoPaused = true;
+        emit AutoPaused(true);
     }
 
     /// AUTO signature = abi.encode(lockId, to, deadline, verifierSig); HUMAN signature = 65 bytes.
@@ -83,6 +89,9 @@ contract RedeemReleaseAdmin is IERC1271, EIP712 {
         emit Vetoed(locker, lockId, veto);
     }
 
+    /// Returns address(0) for a malformed signature. That is only safe because `human` and `verifier`
+    /// are immutable and zero-checked in the constructor: never make either settable without the
+    /// same check, or every malformed signature would be accepted.
     function _signer(bytes32 digest, bytes memory sig) internal pure returns (address signer) {
         (signer,,) = ECDSA.tryRecover(digest, sig);
     }

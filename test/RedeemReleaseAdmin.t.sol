@@ -62,6 +62,16 @@ contract RedeemReleaseAdminTest is Test {
         vm.warp(block.timestamp + 48 hours);
         open.executeRoles(_sign(HUMAN_PK, open.acceptAdminDigest(address(ra))));
         assertEq(open.admin(), address(ra));
+        assertTrue(ra.autoPaused()); // deployed disarmed
+        vm.prank(human);
+        ra.setAutoPaused(false);
+    }
+
+    function test_deploysDisarmed() public {
+        RedeemReleaseAdmin fresh = new RedeemReleaseAdmin(human, verifier, address(open), address(own));
+        assertTrue(fresh.autoPaused());
+        vm.expectRevert(RedeemReleaseAdmin.ZeroAddress.selector);
+        new RedeemReleaseAdmin(human, verifier, address(open), address(0));
     }
 
     function _autoSig(address locker, uint256 id, address to, uint256 dl, uint256 pk) internal view returns (bytes memory) {
