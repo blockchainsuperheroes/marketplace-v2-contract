@@ -33,8 +33,9 @@ interface IOwnableCollection {
 /// - Offers name one collection and are only filled with that collection's tokens. An offer may
 ///   restrict which tokens fill it with a Merkle root of token ids (trait offers, single-item offers).
 /// - Payouts are pushed with a gas limit; if a receiver rejects them they are kept for withdraw().
-/// - Owner powers: fee, royalties, treasury / floor fund, which collections trade, pause, and, while
-///   paused, refunding offers to their bidders. The owner can never move anyone's NFT or money elsewhere.
+/// - Owner powers: fee, royalties, treasury / floor fund, which collections trade, pause / unpause,
+///   naming a guardian (a hot key that can only pause), and, while paused, refunding offers to their
+///   bidders. The owner can never move anyone's NFT or money elsewhere.
 contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public constant MAX_FEE_BPS = 500;
     uint256 public constant MAX_ROYALTY_BPS = 1000;
@@ -83,6 +84,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
 
     address public treasury;
     address public floorFund;
+    address public guardian; // may pause (never unpause); 0 = owner only
     uint16 public feeBps;
     uint16 public defaultRoyaltyBps;
 
@@ -103,6 +105,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event DefaultRoyaltySet(uint256 bps);
     event TreasurySet(address treasury);
     event FloorFundSet(address floorFund);
+    event GuardianSet(address guardian);
 
     error CollectionNotAllowed();
     error LengthMismatch();
@@ -127,6 +130,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error SelfServeIsBlocked();
     error NothingToWithdraw();
     error WithdrawFailed();
+    error NotGuardian();
 
     constructor(address owner_, address treasury_, address floorFund_, uint16 feeBps_, uint16 defaultRoyaltyBps_)
         Ownable(owner_)
@@ -284,12 +288,13 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// Collect payouts that could not be pushed to you.
     function withdraw() external nonReentrant {
-        uint256 amount = pendingPayouts[msg.sender];
-        if (amount == 0) revert NothingToWithdraw();
-        pendingPayouts[msg.sender] = 0;
-        (bool ok,) = msg.sender.call{value: amount}("");
-        if (!ok) revert WithdrawFailed();
-        emit Withdrawn(msg.sender, amount);
+        _withdraw(msg.sender);
+    }
+
+    /// Anyone may push a payee's held payout to the payee (and only to the payee), e.g. for a contract
+    /// wallet that can receive with more gas but can't call withdraw() itself.
+    function withdrawFor(address payee) external nonReentrant {
+        _withdraw(payee);
     }
 
     /// Who is paid the royalty for a collection right now, at what rate, and whether a creator registered.
@@ -352,8 +357,15 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         _setFloorFund(floorFund_);
     }
 
-    function pause() external onlyOwner {
+    /// The owner or the guardian (a hot key for emergencies) can pause; only the owner can unpause.
+    function pause() external {
+        if (msg.sender != owner() && msg.sender != guardian) revert NotGuardian();
         _pause();
+    }
+
+    function setGuardian(address guardian_) external onlyOwner {
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
     }
 
     function unpause() external onlyOwner {
@@ -363,6 +375,9 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     // ───────────────────────────── Internals ─────────────────────────────
 
     function _isLive(address collection, uint256 tokenId, Listing memory l) internal view returns (bool) {
+        // A disallowed collection's listings count as stale, so they can be cleared and can't all come
+        // back at their old prices if the collection is allowed again.
+        if (!collectionAllowed[collection]) return false;
         if (l.expiry < block.timestamp || l.nonce != sellerNonce[l.seller]) return false;
         IERC721 nft = IERC721(collection);
         try nft.ownerOf(tokenId) returns (address owner) {
@@ -389,7 +404,10 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 royaltyBps,
         uint256 offerId
     ) internal {
-        (address receiver,, bool registered) = royaltyFor(collection);
+        // The seller pays the lower of the rate frozen into their order and today's rate, to today's
+        // receiver: a later registration can't raise what an open listing or offer pays.
+        (address receiver, uint256 currentBps, bool registered) = royaltyFor(collection);
+        if (currentBps < royaltyBps) royaltyBps = currentBps;
         uint256 royalty = (price * royaltyBps) / 10_000;
         if (fee > 0) _pay(treasury, fee);
         if (royalty > 0) {
@@ -398,6 +416,15 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         }
         _pay(seller, price - royalty);
         emit Sale(collection, tokenId, seller, buyer, price, fee, royalty, offerId);
+    }
+
+    function _withdraw(address payee) internal {
+        uint256 amount = pendingPayouts[payee];
+        if (amount == 0) revert NothingToWithdraw();
+        pendingPayouts[payee] = 0;
+        (bool ok,) = payee.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit Withdrawn(payee, amount);
     }
 
     function _closeOffer(uint256 offerId) internal {

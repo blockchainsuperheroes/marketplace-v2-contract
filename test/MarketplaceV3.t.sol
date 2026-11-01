@@ -345,9 +345,71 @@ contract MarketplaceV3Test is Test {
         m.setTreasury(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         m.setCollectionAllowed(address(a), false);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.expectRevert(PentagonMarketplaceV3.NotGuardian.selector);
         m.pause();
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        m.setGuardian(alice);
         vm.stopPrank();
+    }
+
+    function test_guardian_canPauseButNotUnpause() public {
+        address g = makeAddr("guardian");
+        vm.prank(owner);
+        m.setGuardian(g);
+        vm.prank(g);
+        m.pause();
+        assertTrue(m.paused());
+        vm.prank(g);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, g));
+        m.unpause();
+        vm.prank(owner);
+        m.unpause();
+        assertFalse(m.paused());
+    }
+
+    function test_royalty_loweredAfterListing_sellerPaysTheLowerRate() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 1000);
+        c.mint(alice, 1);
+        vm.prank(alice);
+        c.setApprovalForAll(address(m), true);
+        _list(alice, MockNFT(address(c)), 1, 1 ether); // frozen at 10%
+
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), address(0), 0); // removed: back to the 2.5% default
+        _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
+        assertEq(floorFund.balance, 0.025 ether); // not the frozen 10%
+        assertEq(alice.balance, 0.975 ether);
+    }
+
+    function test_disallowedCollection_listingsAreStaleAndClearable() public {
+        _list(alice, a, 1, 1 ether);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(a), false);
+        assertFalse(m.isListingLive(address(a), 1));
+        m.clearStale(address(a), _ids(1));
+        vm.prank(owner);
+        m.setCollectionAllowed(address(a), true);
+        vm.expectRevert(PentagonMarketplaceV3.NotListed.selector); // old price did not come back
+        _buy(buyer, a, 1, 1 ether, 2 ether);
+    }
+
+    function test_withdrawFor_paysOnlyThePayee() public {
+        PickySeller s = new PickySeller();
+        a.mint(address(s), 8);
+        s.approve(a, address(m));
+        s.list(m, address(a), 8, 1 ether);
+        _buy(buyer, a, 8, 1 ether, 1.025 ether);
+        assertEq(m.pendingPayouts(address(s)), 0.975 ether);
+
+        s.setAccept(true);
+        vm.prank(carol); // anyone can trigger it; the money still goes to the payee
+        m.withdrawFor(address(s));
+        assertEq(address(s).balance, 0.975 ether);
+        assertEq(carol.balance, 0);
     }
 
     function test_ownership_isTwoStep() public {
