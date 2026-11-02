@@ -18,9 +18,12 @@ interface IReleaseDigest {
 ///             that locker's `releaseDigest(lockId, to, deadline)`, so it can never authorize a withdrawal,
 ///             a role change or anything else. The lockers only accept a release submitted by their
 ///             keeper, so an auto release needs both the keeper (sender) and the verifier (signature).
-///         The verifier signs only after re-reading the claim itself: paid in PC at the listed price,
-///         unreleased 72h after the claim, delivery address a plain wallet. Off-chain rules; on-chain we
-///         additionally refuse a recipient that has code here.
+///         The verifier signs only after re-reading the claim itself: paid at the listed price and still
+///         escrowed, delivery wallet bound to the payer and a plain wallet on both chains. When to sign is
+///         off-chain policy (nftprof 2026-11-02): 1h after payment finality; 24h when the piece is worth
+///         10 PC / 10,000 Points / 0.25 ETH / USD 500 or more; 72h when the receiver isn't bound to the payer
+///         or its binding changed in the last 7 days. On-chain we additionally refuse a recipient that has
+///         code here.
 ///         Signatures can't outlive 48h: the lockers check `deadline` (≤ now + 48h) BEFORE asking us.
 ///         AUTO starts switched off; `human` arms it after the handover, can switch it off instantly, or veto it for one lock (the 72h wait is the window to
 ///         do so). Nothing about this contract can change except those two switches: changing the
