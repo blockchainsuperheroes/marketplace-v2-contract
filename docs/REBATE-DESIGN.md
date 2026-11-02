@@ -11,6 +11,12 @@ This file collects the design so far: nftprof's decisions (2026-10-31) and the B
 - **No rebate** when the NFT returns to an owner it had in the previous 7 days.
 - **Caps are in PC, not ETH:** a per-wallet daily cap, so a manipulated rate can't raise the payout past it.
 
+## The rebate is a share of the FEE PAID (audit F-12)
+
+Rebate = 80% of `Sale.fee`, i.e. 2% of the price at today's 2.5% fee. It is never a share of
+`Sale.price`. Private (person-to-person) sales pay no fee, so they earn no rebate. Otherwise two
+colluding wallets could farm 2% of any price for free.
+
 ## Wash-trade arithmetic (the safety argument)
 
 A self-dealt sale costs `fee + royalty` and earns `rebate`. The rebate is only safe while

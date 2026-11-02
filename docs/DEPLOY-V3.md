@@ -40,7 +40,7 @@ forge script script/DeployMarketplaceV3.s.sol --rpc-url $ETH_RPC --broadcast --v
    - list, buy from a second wallet, check the payouts (seller price − royalty; treasury fee; royalty receiver);
    - place an offer, accept it, cancel a second offer.
 4. Put the address into the frontend's `lib/marketV3.ts` (chain 1). The V3 UI turns on per chain.
-5. Keeper job: watch `Transfer` events of the allowed collections and call `clearStale` for listings whose seller no longer holds the NFT.
+5. Keeper job: watch `Transfer` AND `ApprovalForAll` / `Approval` events of the allowed collections, and call `clearStale` for listings that are no longer live. A listing made stale by revoking approval would otherwise come back at its old price when the seller approves again (audit F-1).
 
 ## Emergency
 

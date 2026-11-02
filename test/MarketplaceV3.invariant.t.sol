@@ -1857,20 +1857,12 @@ contract MarketplaceV3FuzzTest is Test {
         assertEq(seller.balance, 10 ether); // the round trip cost the pair nothing
     }
 
-    /// F-5: renounceOwnership (inherited) is callable. Renouncing while paused freezes trading for good;
-    /// exits (cancelOffer, withdraw, delist) still work, so no funds are lost.
-    function test_F5_renounceWhilePausedLeavesExitsWorking() public {
-        vm.deal(buyer, 2 ether);
-        vm.prank(buyer);
-        uint256 oid = m.placeOffer{value: 1.025 ether}(address(a), 1 ether, 1, block.timestamp + 1 days, bytes32(0));
-        vm.startPrank(owner);
-        m.pause();
+    /// F-5 (fixed): renounceOwnership is disabled, so the marketplace can never become ownerless.
+    function test_F5_renounceOwnershipDisabled() public {
+        vm.prank(owner);
+        vm.expectRevert(M.RenounceDisabled.selector);
         m.renounceOwnership();
-        vm.stopPrank();
-        assertEq(m.owner(), address(0));
-        vm.prank(buyer);
-        m.cancelOffer(oid);
-        assertEq(buyer.balance, 2 ether);
+        assertEq(m.owner(), owner);
     }
 }
 

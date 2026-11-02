@@ -147,6 +147,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error NothingToWithdraw();
     error WithdrawFailed();
     error NotGuardian();
+    error RenounceDisabled();
     error NotAllowedToWithdraw();
     error BadRecipient();
     error AmountTooHigh();
@@ -416,6 +417,12 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert WithdrawFailed();
         emit FloorFundWithdrawn(collection, to, amount, msg.sender);
+    }
+
+    /// Disabled: an ownerless marketplace would strand floor funds and lose unpause and refunds.
+    /// Hand over with the two-step transferOwnership instead.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     /// The owner or the guardian (a hot key for emergencies) can pause; only the owner can unpause.
