@@ -12,6 +12,12 @@ nftprof: "like Coinbase, not a small exchange listing anything; no innovation zo
 - **VERIFY**: a blue chip or near-blue chip whose terms could not be found, do not clearly cover this contract, or depend on a grantor that may no longer exist. It also covers one owner call on blue-chip status. Do not list until resolved.
 - **EXCLUDE**: the current terms grant holders personal use only, or the collection is not an established blue chip (dormant, dead infrastructure, no rights-granting entity, or a utility/game token).
 
+### Owner decisions (nftprof, 2026-11-02)
+
+- **uwucrew and Killer GF: LAUNCH.** Both are Kusari (same team). Pentagon Games is a top holder in both and knows the founders, so it can help establish the floor. The rights were already clear (CC BY 4.0 for holders).
+- **Remilio Babies: LAUNCH.** It is Milady's (Remilia's) second collection under the same VPL. Sub-collections of a launch collection are acceptable when their licence covers them.
+- **Robotos:** not discussed; stays EXCLUDE.
+
 Primary sources are the project's own licence or terms page, docs, or announcement. Secondary sources (press, wikis, OpenSea, Wayback copies of dead sites) are marked as such. "Unclear" always lists what was searched.
 
 ## ERC-721L tiers and what they unlock
@@ -53,16 +59,16 @@ Prior → current compares with nft-data 2026-07-10. **CHANGED** means the type,
 | 13 | Moonbirds | Pixel art: CC0 (PROOF, 2022). Terms name Yuga Labs; Orange Cap Games says it owns the IP | **CC0** (pixel art) + holder licence (Illustrated art) | yes for anyone (pixel); holder, no cap (Illustrated) | yes / allowed | 7 pixel; 4 Illustrated (text) | M S R | generative/algorithmic (pixel traits) | Justin Mezzell (pixel); Illustrated not credited | commercial "do NOT label CC0" → CC0 still current. **CHANGED** | high (pixel CC0) | **LAUNCH** |
 | 14 | Milady Maker | Remilia | VPL | yes (anyone), share-alike | yes, must stay VPL / allowed | 6 (text) | M S R(VPL) | generative/algorithmic (illustrated layers) | Yuyu, Sprite, Charlotte Fang (+ Ika, Worm) | copyleft, verified → same. unchanged | high | **LAUNCH** |
 | 15 | Robotos | Pablo Stanley (individual) | commercial-to-holder | yes, no cap | yes / unspecified (sell right in Scope) | 4 (text) | M S R | generative/algorithmic (illustrated traits) | Pablo Stanley | commercial, verified → same. unchanged | high (text) | **EXCLUDE** |
-| 16 | uwucrew | Kusari (uwu Labs) | commercial-to-holder: CC BY 4.0 for holders | yes, no cap, attribution | yes / allowed | 4 (text); 7 for "The Crew" | M S R | generative/algorithmic (hand-drawn traits) | Laur | commercial, verified → URL wrong. **CHANGED** | high | **EXCLUDE** |
+| 16 | uwucrew | Kusari (uwu Labs) | commercial-to-holder: CC BY 4.0 for holders | yes, no cap, attribution | yes / allowed | 4 (text); 7 for "The Crew" | M S R | generative/algorithmic (hand-drawn traits) | Laur | commercial, verified → URL wrong. **CHANGED** | high | **LAUNCH** (owner decision) |
 | 17 | BAKC | Yuga Labs (presumed) | unclear: no BAKC licence text; Yuga's link is 404 | unclear | unclear | 0 (4 if Yuga terms apply: inferred) | none | unverified | not publicly credited | commercial, likely → unknown. **CHANGED** | low | **VERIFY** |
 | 18 | Pudgy Penguins | LSLTTT Holdings Inc. | commercial-to-holder, **capped** | capped: USD 500k gross / 12 months | not expressly granted / goods with the image allowed | 2 (text), capped | M | generative/algorithmic | Antoine Mingo (artist's account) | limited_commercial, verified → same. unchanged | high | **LAUNCH** |
-| 19 | Killer GF | Kusari | commercial-to-holder (CC BY 4.0 model) | yes, no cap, attribution | yes / allowed | 4 (text); 7 for KGF Army (inferred IDs) | M S R | generative/algorithmic (hand-drawn traits) + 7 hand-made 1/1s | Zeronis | commercial, verified → same. unchanged | high | **EXCLUDE** |
+| 19 | Killer GF | Kusari | commercial-to-holder (CC BY 4.0 model) | yes, no cap, attribution | yes / allowed | 4 (text); 7 for KGF Army (inferred IDs) | M S R | generative/algorithmic (hand-drawn traits) + 7 hand-made 1/1s | Zeronis | commercial, verified → same. unchanged | high | **LAUNCH** (owner decision) |
 | 20 | Chimpers | unclear (Timpers LTD?) | unclear: terms URL 404 | unclear | unclear | 0 | none | generative/algorithmic (pixel traits) | Timpers | commercial, verified → unverifiable. **CHANGED** | low | **VERIFY** |
 | 21 | Zombunnies | none found (ChainBoost / ChainGuardians) | none or unclear | no grant found | no grant found | 0 | none | generative/algorithmic | not publicly credited | unknown → same. unchanged (metadata wrong) | low | **EXCLUDE** |
 | 22 | Hexagon City Estates | none found (CVERSE LTD → Pentagon Games) | none or unclear | no grant found | no grant found | 0 | none | unverified | not publicly credited | no row → none. **NEW** | medium | **EXCLUDE** |
 | 23 | BCSH ETH (ours) | Pentagon Games | none published | no grant published | no grant published | 0 | none | unverified | not publicly credited | no row → none. **NEW** | high | **EXCLUDE** |
 | 24 | POW Bull Badge | Pentagon Games | none (soulbound badge) | no grant | no grant | 0 | none | unverified | not publicly credited | no row → none. **NEW** | high | **EXCLUDE** |
-| 25 | Remilio Babies | Remilia | VPL | yes (anyone), share-alike | yes, must stay VPL / allowed | 6 (text) | M S R(VPL) | unverified | Ula (illustration); Surfy, Ika, Charlotte Fang | no row → copyleft. **NEW** | high | **VERIFY** |
+| 25 | Remilio Babies | Remilia | VPL | yes (anyone), share-alike | yes, must stay VPL / allowed | 6 (text) | M S R(VPL) | unverified | Ula (illustration); Surfy, Ika, Charlotte Fang | no row → copyleft. **NEW** | high | **LAUNCH** (owner decision) |
 | 26 | Chain Bunnies | none found (ChainBoost / ChainGuardians) | none or unclear | no grant found | no grant found | 0 | none | generative/algorithmic | not publicly credited | no row → unknown. **NEW** | low | **EXCLUDE** |
 | 27 | Etheremon | none (project closed 2019) | none or unclear | no grant found | no grant found | 0 | none | unverified | not publicly credited | unknown → same. unchanged | low | **EXCLUDE** |
 | 28 | CryptoMorph CG | none found (CryptoMorph, defunct) | none or unclear | no grant found | no grant found | 0 | none | unverified | CryptoMorph (partner project) | no row → unknown. **NEW** | low | **EXCLUDE** |
@@ -70,7 +76,7 @@ Prior → current compares with nft-data 2026-07-10. **CHANGED** means the type,
 | 30 | Chainguardians LE | ChainGuardians (archived terms) | personal-only | no | no / not | 1 (inferred applicability) | none | 2D hand-drawn | Noi Sackda, Lead Artist (project-level) | no row → personal. **NEW** | medium | **EXCLUDE** |
 | 31 | Chainguardians | ChainGuardians (archived terms) | personal-only | no | no / not | 1 (inferred applicability) | none | 2D hand-drawn | Noi Sackda, Lead Artist (project-level) | no row → personal. **NEW** | medium | **EXCLUDE** |
 
-**Totals:** LAUNCH 11, VERIFY 6, EXCLUDE 14.
+**Totals:** LAUNCH 14, VERIFY 5, EXCLUDE 12 (after nftprof's decisions; the research verdicts were LAUNCH 11, VERIFY 6, EXCLUDE 14).
 
 ---
 
@@ -388,7 +394,7 @@ Each section gives the fields asked for, then the citations. "Loaded" means the 
 - **Confidence:** high on the text. **Reason:** not an established blue chip. The project's X account logged off on 2024-02-14 ("it was a good run!"), and a secondary source reports accusations of a rug pull.
 - Sources: https://www.robotos.art/license · https://web.archive.org/web/20221226044959/https://www.robotos.art/ (medium, artist) · https://www.web3isgoinggreat.com/single/creator-of-robotos-nft-project-once-collaborating-on-a-tv-series-with-time-studios-accused-of-rug-pull (secondary)
 
-### 16. uwucrew: EXCLUDE
+### 16. uwucrew: LAUNCH (owner decision; research verdict EXCLUDE)
 `0xf75140376d246d8b1e5b8a48e3f00772468b3c0c`
 - **Entity:** Kusari ("uwucrew is part of the kusari family"; uwu Labs).
 - **Licence:** "The uwu Art License" (Mirror post, 3 May 2022). Holders get CC BY 4.0, non-holders CC BY-NC 4.0, and 25 team-picked "The Crew" tokens are CC0 (IDs not listed in the captured text). uwucrew.art (loaded) links it: "uwucrew uses the uwu art license".
@@ -445,7 +451,7 @@ Each section gives the fields asked for, then the citations. "Loaded" means the 
 - **Confidence:** high. **Reason:** blue chip with a live capped commercial licence. Note the cap for merch lines.
 - Sources: https://claim.pudgypenguins.com/ip-rights · https://www.overpassip.com/terms · https://opensea.io/collection/pudgypenguins/overview · https://decrypt.co/307098/pudgy-penguins-artist-new-berachain-nft-collection (artist's account)
 
-### 19. Killer GF: EXCLUDE
+### 19. Killer GF: LAUNCH (owner decision; research verdict EXCLUDE)
 `0x6be69b2a9b153737887cfcdca7781ed1511c7e36`
 - **Entity:** Kusari. Same `owner()` as uwucrew: `0x59A722b3…5Cf66`.
 - **Licence:** "Killer GF Art License", "Based on the uwu Art License" (text read from the site's JS bundle). Commercial for holders, personal only for non-holders ("commercial use is strictly prohibited for non-holders"). A CC0 "KGF Army" mascot subset, apparently token IDs 3–6 (inferred from site code).
@@ -549,7 +555,7 @@ Each section gives the fields asked for, then the citations. "Loaded" means the 
 - **Confidence:** high. **Reason:** a non-transferable utility badge, not a collectible.
 - Sources: https://etherscan.io/address/0x2094e4f1ad01438eca93092e87033f87d8f76f63
 
-### 25. Remilio Babies: VERIFY
+### 25. Remilio Babies: LAUNCH (owner decision; research verdict VERIFY)
 `0xD3D9ddD0CF0A5F0BFB8f7fcEAe075DF687eAEBaB`
 - **Entity:** Remilia (same `owner()` as Milady: `0x54F8E4E9…D728cB`).
 - **Licence:** VPL. remilio.org (loaded) uses the same copyleft statement as miladymaker.net.
@@ -678,10 +684,10 @@ Each section gives the fields asked for, then the citations. "Loaded" means the 
 
 Rights-qualified only. Per the note now at the top of `LAUNCH-COLLECTIONS-ETH.md`, the final allowlist is these AND nft-data `supported = true`. The order and spelling are copied from `LAUNCH-COLLECTIONS-ETH.md`.
 
-MoonCats (Acclimated), Meebits, Beanz, MAYC, Azuki Elementals, BAYC, World of Women, Azuki, Moonbirds, Milady Maker, Pudgy Penguins:
+MoonCats (Acclimated), Meebits, Beanz, MAYC, Azuki Elementals, BAYC, World of Women, Azuki, Moonbirds, Milady Maker, Pudgy Penguins, then the owner decisions uwucrew, Killer GF, Remilio Babies:
 
 ```
-0xc3f733ca98e0dad0386979eb96fb1722a1a05e69,0x7bd29408f11d2bfc23c34f18275bbf23bb716bc7,0x306b1ea3ecdf94ab739f1910bbda052ed4a9f949,0x60e4d786628fea6478f785a6d7e704777c86a7c6,0xb6a37b5d14d502c3ab0ae6f3a0e058bc9517786e,0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d,0xe785e82358879f061bc3dcac6f0444462d4b5330,0xed5af388653567af2f388e6224dc7c4b3241c544,0x23581767a106ae21c074b2276d25e5c3e136a68b,0x5af0d9827e0c53e4799bb226655a1de152a425a5,0xbd3531da5cf5857e7cfaa92426877b022e612cf8
+0xc3f733ca98e0dad0386979eb96fb1722a1a05e69,0x7bd29408f11d2bfc23c34f18275bbf23bb716bc7,0x306b1ea3ecdf94ab739f1910bbda052ed4a9f949,0x60e4d786628fea6478f785a6d7e704777c86a7c6,0xb6a37b5d14d502c3ab0ae6f3a0e058bc9517786e,0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d,0xe785e82358879f061bc3dcac6f0444462d4b5330,0xed5af388653567af2f388e6224dc7c4b3241c544,0x23581767a106ae21c074b2276d25e5c3e136a68b,0x5af0d9827e0c53e4799bb226655a1de152a425a5,0xbd3531da5cf5857e7cfaa92426877b022e612cf8,0xf75140376d246d8b1e5b8a48e3f00772468b3c0c,0x6be69b2a9b153737887cfcdca7781ed1511c7e36,0xD3D9ddD0CF0A5F0BFB8f7fcEAe075DF687eAEBaB
 ```
 
 ## Corrections to send back to nft-data
