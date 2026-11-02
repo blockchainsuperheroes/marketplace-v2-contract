@@ -30,6 +30,10 @@ interface IOwnableCollection {
 ///   rebate returns, so the default royalty is part of that safety argument: re-check the rebate
 ///   before lowering it or the fee (docs/REBATE-DESIGN.md).
 /// - Nobody can buy their own listing or fill their own offer.
+/// - Free person-to-person sales: listPrivate names the one wallet that may buy. No fee and no
+///   royalty are charged on it (and the off-chain PC rebate, which is a share of the fee, is nothing).
+/// - Tips: a buyer may add an optional tip to any purchase, at most 5% of what the items cost; it goes
+///   to the tip jar (NFTC liquidity), which the owner sets.
 /// - A listing is live only while the seller still owns the NFT, it has not expired (max 180 days)
 ///   and the seller has not bumped their nonce (cancel-all). Every sale deletes it; anyone may clear
 ///   a listing that is no longer live, so it can never come back at an old price.
@@ -84,15 +88,19 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => Royalty) public registeredRoyalty;
     mapping(address => uint256) public pendingPayouts;
     mapping(address => bool) public selfServeBlocked;
+    /// collection => tokenId => the only wallet allowed to buy that listing (0 = anyone)
+    mapping(address => mapping(uint256 => address)) public privateBuyer;
     /// Unregistered royalties held per collection (see the header).
     mapping(address => uint256) public floorFundOf;
 
     address public treasury;
     address public guardian; // may pause (never unpause); 0 = owner only
+    address public tipJar; // where buyer tips go (NFTC liquidity)
     uint16 public feeBps;
     uint16 public defaultRoyaltyBps;
 
     event Listed(address indexed collection, uint256 indexed tokenId, address indexed seller, uint256 price, uint256 expiry, uint256 feeBps, uint256 royaltyBps);
+    event PrivateListed(address indexed collection, uint256 indexed tokenId, address indexed seller, address buyer);
     event ListingRemoved(address indexed collection, uint256 indexed tokenId, address indexed seller);
     event NonceIncremented(address indexed seller, uint256 nonce);
     /// offerId 0 = bought from a listing
@@ -110,6 +118,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event TreasurySet(address treasury);
     event FloorFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
     event GuardianSet(address guardian);
+    event TipJarSet(address tipJar);
+    event Tipped(address indexed buyer, uint256 amount);
 
     error CollectionNotAllowed();
     error LengthMismatch();
@@ -128,6 +138,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     error NotBidder();
     error TokenNotInOffer();
     error SelfTrade();
+    error NotPrivateBuyer();
+    error TipTooHigh();
     error BpsTooHigh();
     error ZeroAddress();
     error NotCollectionOwner();
@@ -143,6 +155,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         Ownable(owner_)
     {
         _setTreasury(treasury_);
+        tipJar = treasury_;
+        emit TipJarSet(treasury_);
         _setFee(feeBps_);
         _setDefaultRoyalty(defaultRoyaltyBps_);
     }
@@ -157,18 +171,34 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         if (!collectionAllowed[collection]) revert CollectionNotAllowed();
         if (tokenIds.length != prices.length) revert LengthMismatch();
         if (expiry <= block.timestamp || expiry > block.timestamp + MAX_DURATION) revert BadExpiry();
-        IERC721 nft = IERC721(collection);
-        bool approvedAll = nft.isApprovedForAll(msg.sender, address(this));
-        uint64 nonce = sellerNonce[msg.sender];
         uint16 royaltyBps = _royaltyBps(collection);
         for (uint256 i; i < tokenIds.length; ++i) {
-            uint256 id = tokenIds[i];
-            if (nft.ownerOf(id) != msg.sender) revert NotTokenOwner();
-            if (!approvedAll && nft.getApproved(id) != address(this)) revert NotApproved();
-            if (prices[i] == 0 || prices[i] > type(uint96).max) revert BadPrice();
-            listings[collection][id] = Listing(msg.sender, uint96(prices[i]), uint40(expiry), nonce, feeBps, royaltyBps);
-            emit Listed(collection, id, msg.sender, prices[i], expiry, feeBps, royaltyBps);
+            _list(collection, tokenIds[i], prices[i], expiry, feeBps, royaltyBps);
+            if (privateBuyer[collection][tokenIds[i]] != address(0)) delete privateBuyer[collection][tokenIds[i]];
         }
+    }
+
+    /// Free person-to-person sale: only `buyer` can buy it, and no fee or royalty is charged.
+    function listPrivate(address collection, uint256 tokenId, uint256 price, address buyer, uint256 expiry)
+        external
+        whenNotPaused
+    {
+        if (!collectionAllowed[collection]) revert CollectionNotAllowed();
+        if (expiry <= block.timestamp || expiry > block.timestamp + MAX_DURATION) revert BadExpiry();
+        if (buyer == address(0)) revert ZeroAddress();
+        if (buyer == msg.sender) revert SelfTrade();
+        _list(collection, tokenId, price, expiry, 0, 0);
+        privateBuyer[collection][tokenId] = buyer;
+        emit PrivateListed(collection, tokenId, msg.sender, buyer);
+    }
+
+    function _list(address collection, uint256 id, uint256 price, uint256 expiry, uint16 fee, uint16 royaltyBps) internal {
+        IERC721 nft = IERC721(collection);
+        if (nft.ownerOf(id) != msg.sender) revert NotTokenOwner();
+        if (!nft.isApprovedForAll(msg.sender, address(this)) && nft.getApproved(id) != address(this)) revert NotApproved();
+        if (price == 0 || price > type(uint96).max) revert BadPrice();
+        listings[collection][id] = Listing(msg.sender, uint96(price), uint40(expiry), sellerNonce[msg.sender], fee, royaltyBps);
+        emit Listed(collection, id, msg.sender, price, expiry, fee, royaltyBps);
     }
 
     function delist(address collection, uint256[] calldata tokenIds) external {
@@ -199,13 +229,19 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// Buy one or more listings. Send at least sum(price + fee); the rest is refunded.
-    function buy(BuyItem[] calldata items) external payable nonReentrant whenNotPaused {
+    /// `tip` (optional, at most MAX_FEE_BPS of the items' cost) goes to the tip jar; send it on top.
+    function buy(BuyItem[] calldata items, uint256 tip) external payable nonReentrant whenNotPaused {
         uint256 spent;
         for (uint256 i; i < items.length; ++i) {
             BuyItem calldata it = items[i];
             Listing memory l = listings[it.collection][it.tokenId];
             if (l.seller == address(0)) revert NotListed();
             if (l.seller == msg.sender) revert SelfTrade();
+            address pb = privateBuyer[it.collection][it.tokenId];
+            if (pb != address(0)) {
+                if (pb != msg.sender) revert NotPrivateBuyer();
+                delete privateBuyer[it.collection][it.tokenId];
+            }
             if (!collectionAllowed[it.collection]) revert CollectionNotAllowed();
             if (l.expiry < block.timestamp || l.nonce != sellerNonce[l.seller]) revert ListingNotLive();
             if (l.price > it.maxPrice) revert PriceAboveMax();
@@ -216,6 +252,13 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
             // Reverts if the seller no longer owns the NFT or revoked approval.
             IERC721(it.collection).transferFrom(l.seller, msg.sender, it.tokenId);
             _settle(it.collection, it.tokenId, l.seller, msg.sender, l.price, fee, l.royaltyBps, 0);
+        }
+        if (tip > 0) {
+            if (tip > (spent * MAX_FEE_BPS) / 10_000) revert TipTooHigh();
+            spent += tip;
+            if (spent > msg.value) revert InsufficientPayment();
+            _pay(tipJar, tip);
+            emit Tipped(msg.sender, tip);
         }
         if (msg.value > spent) _pay(msg.sender, msg.value - spent);
     }
@@ -381,6 +424,12 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         _pause();
     }
 
+    function setTipJar(address tipJar_) external onlyOwner {
+        if (tipJar_ == address(0)) revert ZeroAddress();
+        tipJar = tipJar_;
+        emit TipJarSet(tipJar_);
+    }
+
     function setGuardian(address guardian_) external onlyOwner {
         guardian = guardian_;
         emit GuardianSet(guardian_);
@@ -409,6 +458,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     function _removeListing(address collection, uint256 tokenId) internal {
         address seller = listings[collection][tokenId].seller;
         delete listings[collection][tokenId];
+        if (privateBuyer[collection][tokenId] != address(0)) delete privateBuyer[collection][tokenId];
         emit ListingRemoved(collection, tokenId, seller);
     }
 

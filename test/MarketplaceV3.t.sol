@@ -79,7 +79,7 @@ contract MarketplaceV3Test is Test {
         PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
         items[0] = PentagonMarketplaceV3.BuyItem(address(nft), id, maxPrice);
         vm.prank(who);
-        m.buy{value: value}(items);
+        m.buy{value: value}(items, 0);
     }
 
     function _ids(uint256 x) internal pure returns (uint256[] memory r) {
@@ -130,7 +130,7 @@ contract MarketplaceV3Test is Test {
         items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1 ether);
         items[1] = PentagonMarketplaceV3.BuyItem(address(a), 2, 2 ether);
         vm.prank(buyer);
-        m.buy{value: 3.075 ether}(items);
+        m.buy{value: 3.075 ether}(items, 0);
         assertEq(a.ownerOf(1), buyer);
         assertEq(a.ownerOf(2), buyer);
         assertEq(treasury.balance, 0.075 ether);
@@ -414,6 +414,68 @@ contract MarketplaceV3Test is Test {
         vm.prank(creator);
         vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
         m.withdrawFloorFund(address(c), creator, 1);
+    }
+
+    function test_privateSale_onlyNamedBuyer_noFeeNoRoyalty() public {
+        vm.prank(alice);
+        m.listPrivate(address(a), 1, 1 ether, buyer, block.timestamp + 1 days);
+        assertEq(m.privateBuyer(address(a), 1), buyer);
+
+        vm.deal(carol, 5 ether);
+        vm.expectRevert(PentagonMarketplaceV3.NotPrivateBuyer.selector);
+        _buy(carol, a, 1, 1 ether, 1 ether);
+
+        _buy(buyer, a, 1, 1 ether, 1 ether); // exactly the price: no fee
+        assertEq(a.ownerOf(1), buyer);
+        assertEq(alice.balance, 1 ether); // no royalty either
+        assertEq(treasury.balance, 0);
+        assertEq(m.floorFundOf(address(a)), 0);
+        assertEq(m.privateBuyer(address(a), 1), address(0));
+    }
+
+    function test_privateSale_publicRelistClearsTheBuyer_andRules() public {
+        vm.prank(alice);
+        vm.expectRevert(PentagonMarketplaceV3.SelfTrade.selector);
+        m.listPrivate(address(a), 1, 1 ether, alice, block.timestamp + 1 days);
+        vm.prank(alice);
+        vm.expectRevert(PentagonMarketplaceV3.ZeroAddress.selector);
+        m.listPrivate(address(a), 1, 1 ether, address(0), block.timestamp + 1 days);
+        vm.prank(bob); // not the owner
+        vm.expectRevert(PentagonMarketplaceV3.NotTokenOwner.selector);
+        m.listPrivate(address(a), 1, 1 ether, buyer, block.timestamp + 1 days);
+
+        vm.prank(alice);
+        m.listPrivate(address(a), 1, 1 ether, buyer, block.timestamp + 1 days);
+        _list(alice, a, 1, 1 ether); // public relist: anyone may buy, normal fee
+        assertEq(m.privateBuyer(address(a), 1), address(0));
+        vm.deal(carol, 5 ether);
+        _buy(carol, a, 1, 1 ether, 1.025 ether);
+        assertEq(a.ownerOf(1), carol);
+        assertEq(treasury.balance, 0.025 ether);
+    }
+
+    function test_tip_goesToTipJar_cappedAt5Percent() public {
+        address jar = makeAddr("nftcLiquidity");
+        vm.prank(owner);
+        m.setTipJar(jar);
+        vm.prank(alice);
+        m.listPrivate(address(a), 1, 1 ether, buyer, block.timestamp + 1 days);
+
+        PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(PentagonMarketplaceV3.TipTooHigh.selector);
+        m.buy{value: 1.06 ether}(items, 0.06 ether); // over 5% of 1 ETH
+
+        vm.prank(buyer);
+        m.buy{value: 1.05 ether}(items, 0.05 ether);
+        assertEq(jar.balance, 0.05 ether);
+        assertEq(alice.balance, 1 ether); // the seller still gets the full price
+        assertEq(treasury.balance, 0);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        m.setTipJar(alice);
     }
 
     function test_guardian_canPauseButNotUnpause() public {
