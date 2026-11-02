@@ -95,7 +95,7 @@ contract Handler is Test {
     InvNFT[3] internal nfts; // 0 and 1 allowed at start, 2 not
     address[] internal actors;
     TrickyWallet[] internal wallets;
-    address[] internal treasuries;
+    address[] internal jars; // tip-jar candidates
     address[] internal receivers;
     address[] public tracked;
     uint256 internal constant TOKENS = 6;
@@ -103,7 +103,6 @@ contract Handler is Test {
     // ── independent model of owner settings ──
     uint16 public gFee = 250;
     uint16 public gDefRoy = 250;
-    address public gTreasury;
     mapping(address => uint256) public gFloorFund; // model of floorFundOf
     address public gTipJar;
     mapping(address => mapping(uint256 => address)) internal gPriv; // model of privateBuyer
@@ -167,10 +166,9 @@ contract Handler is Test {
 
     constructor() {
         owner = makeAddr("owner");
-        address t1 = makeAddr("treasury1");
+        address t1 = makeAddr("tipJar1");
         m = new M(owner, t1, 250, 250);
-        gTreasury = t1;
-        gTipJar = t1; // the constructor sets the tip jar to the treasury
+        gTipJar = t1;
         for (uint256 i; i < 3; ++i) {
             nfts[i] = new InvNFT(string(abi.encodePacked("C", vm.toString(i))));
         }
@@ -182,9 +180,9 @@ contract Handler is Test {
         actors.push(makeAddr("carol"));
         actors.push(address(wallets[0]));
         actors.push(address(wallets[1]));
-        treasuries.push(t1);
-        treasuries.push(makeAddr("treasury2"));
-        treasuries.push(address(wallets[2]));
+        jars.push(t1);
+        jars.push(makeAddr("tipJar2"));
+        jars.push(address(wallets[2]));
         receivers.push(makeAddr("creator"));
         receivers.push(address(wallets[4]));
 
@@ -209,7 +207,7 @@ contract Handler is Test {
             }
         }
         for (uint256 i; i < actors.length; ++i) tracked.push(actors[i]);
-        for (uint256 i; i < treasuries.length; ++i) tracked.push(treasuries[i]);
+        for (uint256 i; i < jars.length; ++i) tracked.push(jars[i]);
         tracked.push(address(wallets[3])); // a spare smart wallet (was the floor-fund wallet before 1049d1f)
         for (uint256 i; i < receivers.length; ++i) tracked.push(receivers[i]);
         tracked.push(owner);
@@ -671,7 +669,7 @@ contract Handler is Test {
             uint256 fee = (uint256(ls[i].price) * ls[i].feeBps) / 10_000;
             uint256 roy = _settleRoy(items[i].collection, ls[i].price, ls[i].royaltyBps);
             _sellerFloor(ls[i].seller, uint256(ls[i].price) - (uint256(ls[i].price) * ls[i].royaltyBps) / 10_000);
-            _exp(gTreasury, int256(fee));
+            _eFloor[_ci(items[i].collection)] += int256(fee); // the fee goes to the collection's floor fund
             _expRoy(items[i].collection, roy);
             _exp(ls[i].seller, int256(uint256(ls[i].price) - roy));
             _move(items[i].collection, items[i].tokenId, ls[i].seller, x.buyer);
@@ -861,7 +859,7 @@ contract Handler is Test {
         _begin();
         for (uint256 i; i < x.ids.length; ++i) {
             _sellerFloor(x.seller, uint256(o.price) - (uint256(o.price) * o.royaltyBps) / 10_000);
-            _exp(gTreasury, int256(fee));
+            _eFloor[_ci(x.c)] += int256(fee);
             _expRoy(x.c, roy);
             _exp(x.seller, int256(uint256(o.price) - roy));
             _move(x.c, x.ids[i], x.seller, o.bidder);
@@ -1052,13 +1050,16 @@ contract Handler is Test {
         _end(ok, "ownerRegisterRoyalty");
     }
 
-    function ownerSetTreasury(uint256 seed) external {
-        address t = treasuries[seed % treasuries.length];
+    /// renounceOwnership is disabled (F-5 fix): it must always revert, even for the owner.
+    function ownerTriesRenounce() external {
         _begin();
+        bool ok;
         vm.prank(owner);
-        m.setTreasury(t);
-        gTreasury = t;
-        _end(true, "ownerSetTreasury");
+        try m.renounceOwnership() {
+            ok = true;
+        } catch {}
+        if (ok) _v("renounceOwnership: succeeded");
+        _end(ok, "ownerTriesRenounce");
     }
 
     /// Someone (our owner, the collection's owner(), or a stranger) withdraws a collection's floor fund to
@@ -1126,7 +1127,7 @@ contract Handler is Test {
     }
 
     function ownerSetTipJar(uint256 seed) external {
-        address t = seed % 4 == 3 ? address(wallets[3]) : treasuries[seed % treasuries.length];
+        address t = seed % 4 == 3 ? address(wallets[3]) : jars[seed % jars.length];
         _begin();
         vm.prank(owner);
         m.setTipJar(t);
@@ -1253,7 +1254,7 @@ contract Handler is Test {
         if (w == 0) try m.setFee(1) { ok = true; } catch {}
         if (w == 1) try m.setDefaultRoyalty(0) { ok = true; } catch {}
         if (w == 2) try m.registerRoyalty(address(nfts[0]), who, 1000) { ok = true; } catch {}
-        if (w == 3) try m.setTreasury(who) { ok = true; } catch {}
+        if (w == 3) try m.renounceOwnership() { ok = true; } catch {}
         if (w == 4 && who != nfts[0].owner()) {
             uint256 amt = gFloorFund[address(nfts[0])];
             _eFloor[0] = -int256(amt == 0 ? 1 : amt); // only checked if the stranger's call succeeded
@@ -1315,7 +1316,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         s[14] = Handler.ownerSetFee.selector;
         s[15] = Handler.ownerSetDefaultRoyalty.selector;
         s[16] = Handler.ownerRegisterRoyalty.selector;
-        s[17] = Handler.ownerSetTreasury.selector;
+        s[17] = Handler.ownerTriesRenounce.selector;
         s[18] = Handler.withdrawFloorFund.selector;
         s[19] = Handler.ownerSetAllowed.selector;
         s[20] = Handler.ownerPause.selector;
@@ -1425,7 +1426,6 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
             assertEq(rem, g.remaining, "offer remaining");
             assertEq(root, g.root, "offer root");
         }
-        assertEq(m.treasury(), h.gTreasury());
         assertEq(m.paused(), h.gPaused());
         assertEq(m.guardian(), h.gGuardian());
         assertEq(m.tipJar(), h.gTipJar());
@@ -1449,7 +1449,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         uint256 k = h.callKeyCount();
         string[30] memory names = [
             "list", "delist", "incrementNonce", "clearStale", "buy", "placeOffer", "acceptOffer", "cancelOffer",
-            "withdraw", "ownerSetFee", "ownerSetDefaultRoyalty", "ownerRegisterRoyalty", "ownerSetTreasury",
+            "withdraw", "ownerSetFee", "ownerSetDefaultRoyalty", "ownerRegisterRoyalty", "ownerTriesRenounce",
             "withdrawFloorFund", "ownerSetAllowed", "ownerPause", "ownerRefundOffers", "strangerAdmin",
             "creatorRegisterRoyalty", "ownerSetSelfServeBlocked", "withdrawFor", "ownerSetGuardian", "guardianPause",
             "listPrivate", "ownerSetTipJar",
@@ -1473,13 +1473,13 @@ contract MarketplaceV3FuzzTest is Test {
     M m;
     InvNFT a;
     address owner = makeAddr("owner");
-    address treasury = makeAddr("treasury");
+    address tipJar = makeAddr("tipJar");
     address seller = makeAddr("seller");
     address buyer = makeAddr("buyer");
     address creator = makeAddr("creator");
 
     function setUp() public {
-        m = new M(owner, treasury, 250, 250);
+        m = new M(owner, tipJar, 250, 250);
         a = new InvNFT("A");
         vm.prank(owner);
         m.setCollectionAllowed(address(a), true);
@@ -1518,13 +1518,13 @@ contract MarketplaceV3FuzzTest is Test {
 
         assertEq(a.ownerOf(1), buyer);
         assertEq(buyer.balance, over, "buyer paid exactly price + frozen fee");
-        assertEq(treasury.balance, fee);
         if (registered) assertEq(creator.balance, roy);
-        else assertEq(m.floorFundOf(address(a)), roy, "unregistered royalty held as the floor fund");
+        assertEq(m.floorFundOf(address(a)), fee + (registered ? 0 : roy), "fee (+ unregistered royalty) in the floor fund");
         assertEq(seller.balance, price - roy);
+        assertEq(tipJar.balance, 0);
         assertLe(fee, (price * 500) / 10_000);
         assertLe(roy, (price * 1000) / 10_000);
-        assertEq(address(m).balance, registered ? 0 : roy);
+        assertEq(address(m).balance, m.floorFundOf(address(a)));
     }
 
     function testFuzz_offerEscrowRoundTrip(uint256 price, uint256 qty, uint256 fill, uint256 feeBps) public {
@@ -1557,17 +1557,16 @@ contract MarketplaceV3FuzzTest is Test {
             m.cancelOffer(oid);
         }
         uint256 roy = (price * 250) / 10_000; // frozen at placement (and min(frozen, 10%) = 2.5%)
-        assertEq(address(m).balance, roy * fill, "only the floor fund is left");
+        assertEq(address(m).balance, (fee + roy) * fill, "only the floor fund is left");
         assertEq(buyer.balance, (price + fee) * (qty - fill), "unfilled part refunded");
-        assertEq(treasury.balance, fee * fill);
-        assertEq(m.floorFundOf(address(a)), roy * fill);
+        assertEq(m.floorFundOf(address(a)), (fee + roy) * fill, "frozen fee + royalty per fill");
         assertEq(seller.balance, (price - roy) * fill);
     }
 
     /// Whatever the owner does while offers and pending payouts exist, the escrow stays put; the only owner
     /// path that moves escrow (refundOffers) pays the bidder.
-    function testFuzz_ownerCannotMoveEscrow(uint256 seed, address newTreasury, address newRecv) public {
-        vm.assume(newTreasury != address(0) && newRecv != address(0));
+    function testFuzz_ownerCannotMoveEscrow(uint256 seed, address newJar, address newRecv) public {
+        vm.assume(newJar != address(0) && newRecv != address(0));
         vm.deal(buyer, 10 ether);
         vm.prank(buyer);
         uint256 oid = m.placeOffer{value: 1.025 ether}(address(a), 1 ether, 1, block.timestamp + 1 days, bytes32(0));
@@ -1578,7 +1577,7 @@ contract MarketplaceV3FuzzTest is Test {
             if (r == 0) m.setFee(uint16(seed % 501));
             if (r == 1) m.setDefaultRoyalty(uint16(seed % 1001));
             if (r == 2) m.registerRoyalty(address(a), newRecv, uint16(seed % 1001));
-            if (r == 3) m.setTreasury(newTreasury);
+            if (r == 3) m.setTipJar(newJar);
             if (r == 4) m.setGuardian(newRecv);
             if (r == 5) m.setCollectionAllowed(address(a), seed % 2 == 0);
             if (r == 6 && !m.paused()) m.pause();
@@ -1643,7 +1642,8 @@ contract MarketplaceV3FuzzTest is Test {
         items[0] = M.BuyItem(address(a), 2, 1 ether);
         vm.prank(buyer);
         m.buy{value: 1.025 ether}(items, 0);
-        assertEq(m.floorFundOf(address(a)), 0.025 ether, "min(frozen 10%, current 2.5%) into the floor fund");
+        // fees 2 x 0.025 (both sales) + royalty min(frozen 10%, current 2.5%) on the second sale
+        assertEq(m.floorFundOf(address(a)), 0.075 ether, "fees + min(frozen 10%, current 2.5%) into the floor fund");
     }
 
     /// F-3: maxPrice bounds the price only. If the owner raises the fee and the seller re-lists at the same
@@ -1665,20 +1665,20 @@ contract MarketplaceV3FuzzTest is Test {
         assertEq(buyer.balance, 2 ether - 1.05 ether);
     }
 
-    /// F-4: setting the treasury (or floor fund / a royalty receiver) to a contract that cannot receive,
-    /// e.g. the marketplace itself, strands fees in pendingPayouts forever. Only owner misconfiguration.
-    function test_F4_treasuryThatCannotWithdrawStrandsFees() public {
+    /// F-4: setting the tip jar (or a registered royalty receiver) to a contract that cannot receive, e.g. the
+    /// marketplace itself, strands those payouts in pendingPayouts forever. Only owner misconfiguration.
+    function test_F4_tipJarThatCannotReceiveStrandsTips() public {
         vm.prank(owner);
-        m.setTreasury(address(m));
+        m.setTipJar(address(m));
         vm.prank(seller);
         m.list(address(a), _one(1), _one(1 ether), block.timestamp + 30 days);
         vm.deal(buyer, 2 ether);
         M.BuyItem[] memory items = new M.BuyItem[](1);
         items[0] = M.BuyItem(address(a), 1, 1 ether);
         vm.prank(buyer);
-        m.buy{value: 1.025 ether}(items, 0);
-        assertEq(m.pendingPayouts(address(m)), 0.025 ether, "fee parked under the marketplace's own address");
-        assertEq(address(m).balance, 0.025 ether + m.floorFundOf(address(a)));
+        m.buy{value: 1.075 ether}(items, 0.05 ether);
+        assertEq(m.pendingPayouts(address(m)), 0.05 ether, "tip parked under the marketplace's own address");
+        assertEq(address(m).balance, 0.05 ether + m.floorFundOf(address(a)));
     }
 
     /// F-6 (only on the build with self-serve royalties): a collection's owner() can raise its royalty to
@@ -1747,7 +1747,7 @@ contract MarketplaceV3FuzzTest is Test {
         vm.prank(buyer);
         m.buy{value: 1.025 ether}(items, 0);
         uint256 held = m.floorFundOf(address(a));
-        assertEq(held, 0.025 ether);
+        assertEq(held, 0.05 ether); // 2.5% fee + 2.5% unregistered royalty
         if (reg) {
             vm.prank(creator);
             m.registerRoyaltyAsCreator(address(a), creator, 500);
@@ -1784,12 +1784,12 @@ contract MarketplaceV3FuzzTest is Test {
         items[0] = M.BuyItem(address(a), 1, 1 ether);
         vm.prank(buyer);
         m.buy{value: 1.025 ether}(items, 0);
-        assertEq(m.floorFundOf(address(a)), 0.025 ether); // accrued while unregistered, for our floor buys
+        assertEq(m.floorFundOf(address(a)), 0.05 ether); // fee + royalty accrued while unregistered
         vm.startPrank(creator);
         m.registerRoyaltyAsCreator(address(a), creator, 0); // even a 0% registration is enough
-        m.withdrawFloorFund(address(a), creator, 0.025 ether);
+        m.withdrawFloorFund(address(a), creator, 0.05 ether);
         vm.stopPrank();
-        assertEq(creator.balance, 0.025 ether);
+        assertEq(creator.balance, 0.05 ether);
         assertEq(m.floorFundOf(address(a)), 0);
     }
 
@@ -1801,7 +1801,7 @@ contract MarketplaceV3FuzzTest is Test {
             vm.prank(owner);
             m.setTipJar(jar);
         }
-        address to = otherJar ? jar : treasury;
+        address to = otherJar ? jar : tipJar;
         vm.prank(seller);
         m.list(address(a), _one(1), _one(price), block.timestamp + 1 days);
         uint256 cost = price + (price * 250) / 10_000;
@@ -1814,8 +1814,7 @@ contract MarketplaceV3FuzzTest is Test {
         (bool ok,) = address(m).call{value: cost + tip}(abi.encodeCall(M.buy, (items, tip)));
         assertEq(ok, tip * 10_000 <= cost * 500, "tip allowed iff <= 5% of cost");
         if (ok) {
-            uint256 feeToTreasury = otherJar ? 0 : (price * 250) / 10_000;
-            assertEq(to.balance - before, tip + feeToTreasury, "tip went to the tip jar");
+            assertEq(to.balance - before, tip, "tip went to the tip jar, and only the tip");
             assertEq(buyer.balance, 0);
         }
     }
@@ -1835,8 +1834,7 @@ contract MarketplaceV3FuzzTest is Test {
         if (ok) {
             assertEq(a.ownerOf(1), buyer);
             assertEq(seller.balance, price, "seller got the full price");
-            assertEq(treasury.balance, 0, "no fee");
-            assertEq(m.floorFundOf(address(a)), 0, "no royalty");
+            assertEq(m.floorFundOf(address(a)), 0, "no fee and no royalty");
             assertEq(m.privateBuyer(address(a), 1), address(0), "cleared after the sale");
         }
     }
@@ -1855,6 +1853,42 @@ contract MarketplaceV3FuzzTest is Test {
         vm.prank(buyer);
         m.buy{value: 10 ether}(items, 0);
         assertEq(seller.balance, 10 ether); // the round trip cost the pair nothing
+    }
+
+    /// F-14: since 9ac7a41 the buyer fee goes to the collection's floor fund, which a registered creator can
+    /// withdraw. A creator self-dealing in their own registered collection (two fresh wallets, royalty to a
+    /// third) gets the fee and the royalty back: the round trip costs 0 ETH, yet Sale.fee is a full 2.5%,
+    /// so a rebate of 80% of Sale.fee pays them 2% of the price in PC for free, at any size.
+    function test_F14_registeredCreatorWashTradesForFree() public {
+        address sellerW = makeAddr("creatorWalletA");
+        address buyerW = makeAddr("creatorWalletB");
+        InvNFT c = new InvNFT("C");
+        c.setOwner(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 1000); // royalty to a third wallet of theirs
+        c.mint(sellerW, 1);
+        vm.prank(sellerW);
+        c.setApprovalForAll(address(m), true);
+        vm.deal(buyerW, 10.25 ether);
+        uint256 groupBefore = sellerW.balance + buyerW.balance + creator.balance;
+
+        vm.prank(sellerW);
+        m.list(address(c), _one(1), _one(10 ether), block.timestamp + 1 days);
+        M.BuyItem[] memory items = new M.BuyItem[](1);
+        items[0] = M.BuyItem(address(c), 1, 10 ether);
+        vm.expectEmit(true, true, true, true, address(m));
+        emit M.Sale(address(c), 1, sellerW, buyerW, 10 ether, 0.25 ether, 1 ether, 0); // fee 0.25 -> rebate basis
+        vm.prank(buyerW);
+        m.buy{value: 10.25 ether}(items, 0);
+        uint256 fund = m.floorFundOf(address(c));
+        assertEq(fund, 0.25 ether, "the fee sits in the creator-withdrawable floor fund");
+        vm.prank(creator);
+        m.withdrawFloorFund(address(c), creator, fund); // the fee comes back
+
+        assertEq(sellerW.balance + buyerW.balance + creator.balance, groupBefore, "round trip cost 0 ETH");
+        assertEq(c.ownerOf(1), buyerW);
     }
 
     /// F-5 (fixed): renounceOwnership is disabled, so the marketplace can never become ownerless.
@@ -1932,13 +1966,13 @@ contract MarketplaceV3SymbolicTest is Test {
     InvNFT a;
     InvNFT b;
     address owner = address(0x1000);
-    address treasury = address(0x2000);
+    address tipJar = address(0x2000);
     address seller = address(0x4000);
     address bidder = address(0x5000);
     address creator = address(0x6000);
 
     function setUp() public {
-        m = new M(owner, treasury, 250, 250);
+        m = new M(owner, tipJar, 250, 250);
         a = new InvNFT("A");
         b = new InvNFT("B");
         vm.startPrank(owner);
@@ -1972,7 +2006,6 @@ contract MarketplaceV3SymbolicTest is Test {
         if (registered) m.registerRoyalty(address(a), creator, royBps);
         else m.setDefaultRoyalty(royBps);
         vm.stopPrank();
-        vm.deal(treasury, 0);
         vm.deal(creator, 0);
         vm.deal(seller, 0);
         vm.prank(seller);
@@ -1985,13 +2018,14 @@ contract MarketplaceV3SymbolicTest is Test {
         items[0] = M.BuyItem(address(a), 1, price);
         vm.prank(buyer);
         m.buy{value: value}(items, 0);
-        uint256 roy = registered ? creator.balance : m.floorFundOf(address(a));
+        uint256 floor = m.floorFundOf(address(a));
         assert(a.ownerOf(1) == buyer);
         assert(buyer.balance == over);
-        assert(treasury.balance + roy + seller.balance == uint256(price) + fee);
-        assert(treasury.balance * 10_000 <= uint256(price) * 500);
-        assert(roy * 10_000 <= uint256(price) * 1000);
-        assert(address(m).balance == (registered ? 0 : roy));
+        // seller + royalty receiver + floor fund == everything the buyer paid
+        assert(seller.balance + creator.balance + floor == uint256(price) + fee);
+        // the seller loses at most the 10% royalty cap
+        assert((uint256(price) - seller.balance) * 10_000 <= uint256(price) * 1000);
+        assert(address(m).balance == floor);
     }
 
     /// For every price, an offer for 2 NFTs: fill 0 or 1, cancel the rest -> the contract keeps only the floor
@@ -2126,7 +2160,7 @@ contract MarketplaceV3SymbolicTest is Test {
     function check_nonOwnerCannotUseOwnerPowers(address caller) public {
         vm.assume(caller != owner && caller != address(0)); // no tx has msg.sender 0; guardian 0 = none
         vm.startPrank(caller);
-        (bool ok1,) = address(m).call(abi.encodeCall(M.setTreasury, (caller)));
+        (bool ok1,) = address(m).call(abi.encodeCall(M.renounceOwnership, ()));
         (bool ok2,) = address(m).call(abi.encodeCall(M.setGuardian, (caller)));
         (bool ok3,) = address(m).call(abi.encodeCall(M.registerRoyalty, (address(a), caller, 1000)));
         (bool ok4,) = address(m).call(abi.encodeCall(M.setFee, (500)));
@@ -2223,7 +2257,7 @@ contract LaunchCollectionsForkTest is Test {
             return;
         }
         vm.createSelectFork(rpc);
-        m = new M(owner, makeAddr("treasury"), 250, 250);
+        m = new M(owner, makeAddr("tipJar"), 250, 250);
         uint256 bad;
         for (uint256 i; i < cs.length; ++i) {
             if (vm.envOr("ONLY", address(0)) != address(0) && cs[i] != vm.envOr("ONLY", address(0))) continue;
