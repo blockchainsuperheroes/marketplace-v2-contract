@@ -6,6 +6,7 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {console2} from "forge-std/console2.sol";
 import {PentagonMarketplaceV3 as M} from "../src/MarketplaceV3.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /// Stateful fuzz (invariant) tests and stateless fuzz tests for PentagonMarketplaceV3.
 ///
@@ -103,7 +104,11 @@ contract Handler is Test {
     // ── independent model of owner settings ──
     uint16 public gFee = 250;
     uint16 public gDefRoy = 250;
-    mapping(address => uint256) public gFloorFund; // model of floorFundOf
+    mapping(address => uint256) public gFloorFund; // model of floorFundOf (fees only, since 52655e7)
+    mapping(address => uint256) public gRoyFund; // model of royaltyFundOf (unregistered royalties)
+    mapping(address => uint256) public gAllowance; // model of creatorAllowance
+    mapping(address => uint256) public gAllowanceSet; // value of the last setCreatorAllowance
+    mapping(address => uint256) public gCreatorTaken; // creator withdrawals since that set
     address public gTipJar;
     mapping(address => mapping(uint256 => address)) internal gPriv; // model of privateBuyer
     bool public gPaused;
@@ -163,6 +168,8 @@ contract Handler is Test {
     uint256 internal _vBefore;
     uint256[3] internal _preFloor;
     int256[3] internal _eFloor;
+    uint256[3] internal _preRoy;
+    int256[3] internal _eRoyFund;
 
     constructor() {
         owner = makeAddr("owner");
@@ -271,12 +278,12 @@ contract Handler is Test {
         return x < y ? keccak256(abi.encode(x, y)) : keccak256(abi.encode(y, x));
     }
 
-    /// Expect a royalty: pushed to the registered receiver, or (unregistered) held in floorFundOf[c].
+    /// Expect a royalty: pushed to the registered receiver, or (unregistered) held in royaltyFundOf[c].
     function _expRoy(address c, uint256 roy) internal {
         if (gRegRecv[c] != address(0)) {
             _exp(gRegRecv[c], int256(roy));
         } else {
-            _eFloor[_ci(c)] += int256(roy);
+            _eRoyFund[_ci(c)] += int256(roy);
         }
     }
 
@@ -349,6 +356,8 @@ contract Handler is Test {
         for (uint256 c; c < 3; ++c) {
             _preFloor[c] = m.floorFundOf(address(nfts[c]));
             _eFloor[c] = 0;
+            _preRoy[c] = m.royaltyFundOf(address(nfts[c]));
+            _eRoyFund[c] = 0;
         }
         for (uint256 c; c < 3; ++c) {
             for (uint256 id = 1; id <= TOKENS; ++id) {
@@ -448,6 +457,16 @@ contract Handler is Test {
             }
             if (ok) {
                 gFloorFund[address(nfts[c])] = uint256(int256(gFloorFund[address(nfts[c])]) + e);
+            }
+            // Royalty funds: same, and only withdrawRoyaltyFund may lower them.
+            int256 er = ok ? _eRoyFund[c] : int256(0);
+            int256 dr = int256(m.royaltyFundOf(address(nfts[c]))) - int256(_preRoy[c]);
+            if (dr != er) _v(string.concat(tag, ": royaltyFundOf changed unexpectedly, c", vm.toString(c)));
+            if (dr < 0 && keccak256(bytes(tag)) != keccak256("withdrawRoyaltyFund")) {
+                _v(string.concat(tag, ": royalty fund left other than via withdrawRoyaltyFund"));
+            }
+            if (ok) {
+                gRoyFund[address(nfts[c])] = uint256(int256(gRoyFund[address(nfts[c])]) + er);
             }
         }
         _count(keccak256(abi.encodePacked(tag, ok ? ".ok" : ".revert")));
@@ -1062,9 +1081,8 @@ contract Handler is Test {
         _end(ok, "ownerTriesRenounce");
     }
 
-    /// Someone (our owner, the collection's owner(), or a stranger) withdraws a collection's floor fund to
-    /// someone. Allowed: caller = our owner, or the collection's owner() once registered and not blocked;
-    /// recipient = our owner or the collection's owner(). Anything else succeeding is a violation.
+    /// Someone (our owner, the collection's owner(), or a stranger) withdraws a collection's floor fund (the
+    /// fees). Allowed since 52655e7: our owner only, to any non-zero wallet. A creator never can (F-14 fix).
     function withdrawFloorFund(uint256 callerSeed, uint256 cSeed, uint256 toSeed, uint256 amount) external {
         address c = address(nfts[cSeed % 3]);
         address cOwner = InvNFT(c).owner();
@@ -1079,9 +1097,6 @@ contract Handler is Test {
         uint256 bal = gFloorFund[c];
         amount = bal == 0 ? bound(amount, 1, 1 ether) : bound(amount, 1, bal);
         if (toSeed % 9 == 0) amount = bal + 1; // more than held
-        bool callerOk = caller == owner
-            || (cOwner != address(0) && caller == cOwner && gRegRecv[c] != address(0) && !gBlocked[c]);
-        bool toOk = to == owner || (cOwner != address(0) && to == cOwner);
         _begin();
         _exp(to, int256(amount));
         _eFloor[_ci(c)] = -int256(amount);
@@ -1091,11 +1106,67 @@ contract Handler is Test {
             ok = true;
         } catch {}
         if (ok) {
-            if (!callerOk) _v("withdrawFloorFund: a caller who may not withdraw did");
-            if (!toOk) _v("withdrawFloorFund: paid a recipient other than our owner / the collection owner");
+            if (caller != owner) _v("withdrawFloorFund: someone other than our owner reduced floorFundOf");
             if (amount > bal) _v("withdrawFloorFund: withdrew more than the fund held");
         }
         _end(ok, "withdrawFloorFund");
+    }
+
+    /// Someone withdraws a collection's royalty fund (unregistered royalties). Allowed: our owner, to itself or
+    /// the collection's owner(); or the collection's owner() while self-serve isn't blocked, up to its
+    /// allowance, to the same two recipients.
+    function withdrawRoyaltyFund(uint256 callerSeed, uint256 cSeed, uint256 toSeed, uint256 amount) external {
+        address c = address(nfts[cSeed % 3]);
+        address cOwner = InvNFT(c).owner();
+        uint256 k = callerSeed % 4;
+        address caller = k == 0
+            ? owner
+            : (k != 3 && cOwner != address(0)) ? cOwner : tracked[(callerSeed / 4) % tracked.length];
+        uint256 j = toSeed % 4;
+        address to = j == 0
+            ? owner
+            : (j == 1 && cOwner != address(0)) ? cOwner : j == 2 ? caller : tracked[(toSeed / 4) % tracked.length];
+        uint256 bal = gRoyFund[c];
+        uint256 allow = gAllowance[c];
+        amount = bal == 0 ? bound(amount, 1, 1 ether) : bound(amount, 1, bal);
+        if (toSeed % 7 == 0 && allow != type(uint256).max && allow < type(uint256).max - 1) amount = allow + 1; // over the allowance
+        if (toSeed % 11 == 0) amount = bal + 1; // more than held
+        bool callerOk = caller == owner || (cOwner != address(0) && caller == cOwner && !gBlocked[c] && amount <= allow);
+        bool toOk = to == owner || (cOwner != address(0) && to == cOwner);
+        _begin();
+        _exp(to, int256(amount));
+        _eRoyFund[_ci(c)] = -int256(amount);
+        bool ok;
+        vm.prank(caller);
+        try m.withdrawRoyaltyFund(c, to, amount) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (!callerOk) _v("withdrawRoyaltyFund: a caller who may not withdraw did");
+            if (!toOk) _v("withdrawRoyaltyFund: paid a recipient other than our owner / the collection owner");
+            if (amount > bal) _v("withdrawRoyaltyFund: withdrew more than the fund held");
+            if (caller != owner) {
+                gCreatorTaken[c] += amount;
+                if (allow != type(uint256).max) gAllowance[c] = allow - amount;
+                if (gAllowanceSet[c] != type(uint256).max && gCreatorTaken[c] > gAllowanceSet[c]) {
+                    _v("withdrawRoyaltyFund: creator took more than its allowance");
+                }
+            }
+        }
+        _end(ok, "withdrawRoyaltyFund");
+    }
+
+    function ownerSetCreatorAllowance(uint256 cSeed, uint256 amount) external {
+        address c = address(nfts[cSeed % 3]);
+        uint256 k = amount % 4;
+        amount = k == 0 ? 0 : k == 1 ? type(uint256).max : bound(amount, 1, 2 ether);
+        _begin();
+        vm.prank(owner);
+        m.setCreatorAllowance(c, amount);
+        gAllowance[c] = amount;
+        gAllowanceSet[c] = amount;
+        gCreatorTaken[c] = 0;
+        _end(true, "ownerSetCreatorAllowance");
     }
 
     function ownerSetAllowed(uint256 cSeed, uint8 x) external {
@@ -1250,12 +1321,13 @@ contract Handler is Test {
         _begin();
         bool ok;
         vm.startPrank(who);
-        uint8 w = which % 12;
+        uint8 w = which % 13;
         if (w == 0) try m.setFee(1) { ok = true; } catch {}
         if (w == 1) try m.setDefaultRoyalty(0) { ok = true; } catch {}
         if (w == 2) try m.registerRoyalty(address(nfts[0]), who, 1000) { ok = true; } catch {}
         if (w == 3) try m.renounceOwnership() { ok = true; } catch {}
-        if (w == 4 && who != nfts[0].owner()) {
+        if (w == 4) {
+            // nobody but our owner, creators included, may take the fees
             uint256 amt = gFloorFund[address(nfts[0])];
             _eFloor[0] = -int256(amt == 0 ? 1 : amt); // only checked if the stranger's call succeeded
             _exp(who, int256(amt == 0 ? 1 : amt));
@@ -1268,6 +1340,7 @@ contract Handler is Test {
         if (w == 9) try m.transferOwnership(who) { ok = true; } catch {}
         if (w == 10) ok = SelfServe.setBlocked(m, address(nfts[0]), true);
         if (w == 11) try m.setTipJar(who) { ok = true; } catch {}
+        if (w == 12) try m.setCreatorAllowance(address(nfts[0]), type(uint256).max) { ok = true; } catch {}
         vm.stopPrank();
         if (ok) _v("strangerAdmin: a non-owner used an owner power");
         _end(ok, "strangerAdmin");
@@ -1298,7 +1371,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         h = new Handler();
         m = h.m();
         targetContract(address(h));
-        bytes4[] memory s = new bytes4[](42);
+        bytes4[] memory s = new bytes4[](45);
         s[0] = Handler.list.selector;
         s[1] = Handler.delist.selector;
         s[2] = Handler.incrementNonce.selector;
@@ -1343,6 +1416,9 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         s[39] = Handler.listPrivate.selector;
         s[40] = Handler.listPrivate.selector;
         s[41] = Handler.ownerSetTipJar.selector;
+        s[42] = Handler.withdrawRoyaltyFund.selector;
+        s[43] = Handler.withdrawRoyaltyFund.selector;
+        s[44] = Handler.ownerSetCreatorAllowance.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: s}));
     }
 
@@ -1360,11 +1436,14 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
             pend += m.pendingPayouts(h.tracked(i));
         }
         uint256 floors;
+        uint256 roys;
         for (uint256 c; c < 3; ++c) {
             floors += m.floorFundOf(h.nft(c));
+            roys += m.royaltyFundOf(h.nft(c));
             assertEq(m.floorFundOf(h.nft(c)), h.gFloorFund(h.nft(c)), "floorFundOf != model");
+            assertEq(m.royaltyFundOf(h.nft(c)), h.gRoyFund(h.nft(c)), "royaltyFundOf != model");
         }
-        assertEq(address(m).balance, esc + pend + floors, "balance != escrow + pending + floor funds");
+        assertEq(address(m).balance, esc + pend + floors + roys, "balance != escrow + pending + floor + royalty funds");
         assertEq(esc, h.ghostEscrow(), "on-chain escrow != model escrow");
     }
 
@@ -1372,6 +1451,20 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
     function invariant_noHandlerViolations() public view {
         if (h.violationCount() > 0) {
             assertTrue(false, h.violations(0));
+        }
+    }
+
+    /// A creator never withdraws more of a royalty fund than the allowance our owner last set (unless open),
+    /// and the on-chain allowance is always what is left of it.
+    function invariant_creatorAllowanceNeverExceeded() public view {
+        for (uint256 c; c < 3; ++c) {
+            address col = h.nft(c);
+            assertEq(m.creatorAllowance(col), h.gAllowance(col), "creatorAllowance != model");
+            uint256 set = h.gAllowanceSet(col);
+            if (set != type(uint256).max) {
+                assertLe(h.gCreatorTaken(col), set, "creator took more than the allowance");
+                assertEq(m.creatorAllowance(col), set - h.gCreatorTaken(col), "allowance not reduced by withdrawals");
+            }
         }
     }
 
@@ -1452,12 +1545,12 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
             "withdraw", "ownerSetFee", "ownerSetDefaultRoyalty", "ownerRegisterRoyalty", "ownerTriesRenounce",
             "withdrawFloorFund", "ownerSetAllowed", "ownerPause", "ownerRefundOffers", "strangerAdmin",
             "creatorRegisterRoyalty", "ownerSetSelfServeBlocked", "withdrawFor", "ownerSetGuardian", "guardianPause",
-            "listPrivate", "ownerSetTipJar",
-            "", "", "", "", ""
+            "listPrivate", "ownerSetTipJar", "withdrawRoyaltyFund", "ownerSetCreatorAllowance",
+            "", "", ""
         ];
         k;
         console2.log("self-serve royalties present in this build", h.selfServe());
-        for (uint256 i; i < 25; ++i) {
+        for (uint256 i; i < 27; ++i) {
             console2.log(
                 names[i],
                 h.calls(keccak256(abi.encodePacked(names[i], ".ok"))),
@@ -1519,12 +1612,13 @@ contract MarketplaceV3FuzzTest is Test {
         assertEq(a.ownerOf(1), buyer);
         assertEq(buyer.balance, over, "buyer paid exactly price + frozen fee");
         if (registered) assertEq(creator.balance, roy);
-        assertEq(m.floorFundOf(address(a)), fee + (registered ? 0 : roy), "fee (+ unregistered royalty) in the floor fund");
+        assertEq(m.floorFundOf(address(a)), fee, "the fee, and only the fee, in the floor fund");
+        assertEq(m.royaltyFundOf(address(a)), registered ? 0 : roy, "unregistered royalty in the royalty fund");
         assertEq(seller.balance, price - roy);
         assertEq(tipJar.balance, 0);
         assertLe(fee, (price * 500) / 10_000);
         assertLe(roy, (price * 1000) / 10_000);
-        assertEq(address(m).balance, m.floorFundOf(address(a)));
+        assertEq(address(m).balance, m.floorFundOf(address(a)) + m.royaltyFundOf(address(a)));
     }
 
     function testFuzz_offerEscrowRoundTrip(uint256 price, uint256 qty, uint256 fill, uint256 feeBps) public {
@@ -1559,7 +1653,8 @@ contract MarketplaceV3FuzzTest is Test {
         uint256 roy = (price * 250) / 10_000; // frozen at placement (and min(frozen, 10%) = 2.5%)
         assertEq(address(m).balance, (fee + roy) * fill, "only the floor fund is left");
         assertEq(buyer.balance, (price + fee) * (qty - fill), "unfilled part refunded");
-        assertEq(m.floorFundOf(address(a)), (fee + roy) * fill, "frozen fee + royalty per fill");
+        assertEq(m.floorFundOf(address(a)), fee * fill, "frozen fee per fill");
+        assertEq(m.royaltyFundOf(address(a)), roy * fill, "frozen royalty per fill");
         assertEq(seller.balance, (price - roy) * fill);
     }
 
@@ -1642,8 +1737,8 @@ contract MarketplaceV3FuzzTest is Test {
         items[0] = M.BuyItem(address(a), 2, 1 ether);
         vm.prank(buyer);
         m.buy{value: 1.025 ether}(items, 0);
-        // fees 2 x 0.025 (both sales) + royalty min(frozen 10%, current 2.5%) on the second sale
-        assertEq(m.floorFundOf(address(a)), 0.075 ether, "fees + min(frozen 10%, current 2.5%) into the floor fund");
+        assertEq(m.floorFundOf(address(a)), 0.05 ether, "the two sales' fees");
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether, "min(frozen 10%, current 2.5%) into the royalty fund");
     }
 
     /// F-3: maxPrice bounds the price only. If the owner raises the fee and the seller re-lists at the same
@@ -1678,7 +1773,7 @@ contract MarketplaceV3FuzzTest is Test {
         vm.prank(buyer);
         m.buy{value: 1.075 ether}(items, 0.05 ether);
         assertEq(m.pendingPayouts(address(m)), 0.05 ether, "tip parked under the marketplace's own address");
-        assertEq(address(m).balance, 0.05 ether + m.floorFundOf(address(a)));
+        assertEq(address(m).balance, 0.05 ether + m.floorFundOf(address(a)) + m.royaltyFundOf(address(a)));
     }
 
     /// F-6 (only on the build with self-serve royalties): a collection's owner() can raise its royalty to
@@ -1721,76 +1816,111 @@ contract MarketplaceV3FuzzTest is Test {
         assertTrue(ok, "contract without owner() returns 0");
     }
 
-    /// Floor fund: whoever calls, to whomever, it only ever leaves to our owner or the collection's owner(),
-    /// and only our owner or a registered, unblocked collection owner() can take it out.
-    function testFuzz_floorFundOnlyToAllowed(
-        address caller,
-        address to,
-        uint256 amount,
-        bool reg,
-        bool blocked,
-        uint8 pick
-    ) public {
+    function _sellOne(InvNFT c, uint256 id) internal {
+        c.mint(seller, id);
+        vm.prank(seller);
+        c.setApprovalForAll(address(m), true);
+        vm.prank(seller);
+        m.list(address(c), _one(id), _one(1 ether), block.timestamp + 1 days);
+        vm.deal(buyer, buyer.balance + 1.025 ether);
+        M.BuyItem[] memory items = new M.BuyItem[](1);
+        items[0] = M.BuyItem(address(c), id, 1 ether);
+        vm.prank(buyer);
+        m.buy{value: 1.025 ether}(items, 0);
+    }
+
+    /// Floor fund (the fees): only our owner can take it out, to any non-zero wallet; nobody else, creators
+    /// included, whatever their registration, allowance or block status.
+    function testFuzz_floorFundOnlyOwner(address caller, address to, uint256 amount, bool reg, uint8 pick) public {
         vm.assume(caller != address(0) && to != address(0) && to.code.length == 0 && uint160(to) > 0x10000);
         vm.assume(caller != address(m) && to != address(m));
-        // bias caller / recipient towards the interesting parties: our owner, the creator, a stranger
+        if (pick % 3 == 0) caller = owner;
+        else if (pick % 3 == 1) caller = creator;
+        InvNFT c = new InvNFT("F");
+        c.setOwner(creator);
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        if (reg) {
+            vm.prank(creator);
+            m.registerRoyaltyAsCreator(address(c), creator, 500);
+        }
+        vm.prank(owner);
+        m.setCreatorAllowance(address(c), type(uint256).max); // even an open royalty allowance doesn't help
+        _sellOne(c, 1);
+        uint256 held = m.floorFundOf(address(c));
+        assertEq(held, 0.025 ether);
+        amount = bound(amount, 1, held);
+        uint256 toBefore = to.balance;
+        vm.prank(caller);
+        (bool ok,) = address(m).call(abi.encodeCall(M.withdrawFloorFund, (address(c), to, amount)));
+        assertEq(ok, caller == owner, "only our owner withdraws the floor fund");
+        if (ok) assertEq(to.balance - toBefore, amount);
+        assertEq(m.floorFundOf(address(c)), ok ? held - amount : held);
+    }
+
+    /// Royalty fund: our owner to itself / the collection's owner(); the collection's owner() only up to its
+    /// allowance and while not blocked, to the same two; nobody else.
+    function testFuzz_royaltyFundRules(address caller, address to, uint256 amount, uint256 allowance, bool blocked, uint8 pick)
+        public
+    {
+        vm.assume(caller != address(0) && to != address(0) && to.code.length == 0 && uint160(to) > 0x10000);
+        vm.assume(caller != address(m) && to != address(m));
         if (pick % 3 == 0) caller = owner;
         else if (pick % 3 == 1) caller = creator;
         if ((pick / 3) % 3 == 0) to = owner;
         else if ((pick / 3) % 3 == 1) to = creator;
         a.setOwner(creator);
-        vm.prank(seller);
-        m.list(address(a), _one(1), _one(1 ether), block.timestamp + 1 days);
-        vm.deal(buyer, 2 ether);
-        M.BuyItem[] memory items = new M.BuyItem[](1);
-        items[0] = M.BuyItem(address(a), 1, 1 ether);
-        vm.prank(buyer);
-        m.buy{value: 1.025 ether}(items, 0);
-        uint256 held = m.floorFundOf(address(a));
-        assertEq(held, 0.05 ether); // 2.5% fee + 2.5% unregistered royalty
-        if (reg) {
-            vm.prank(creator);
-            m.registerRoyaltyAsCreator(address(a), creator, 500);
-        }
-        if (blocked) {
-            vm.prank(owner);
-            m.setSelfServeBlocked(address(a), true);
-        }
+        _sellOne(a, 6); // unregistered: 2.5% royalty into the royalty fund
+        uint256 held = m.royaltyFundOf(address(a));
+        assertEq(held, 0.025 ether);
+        allowance = (pick / 9) % 3 == 0 ? type(uint256).max : bound(allowance, 0, held);
+        vm.startPrank(owner);
+        m.setCreatorAllowance(address(a), allowance);
+        if (blocked) m.setSelfServeBlocked(address(a), true);
+        vm.stopPrank();
         amount = bound(amount, 1, held);
         uint256 toBefore = to.balance;
         vm.prank(caller);
-        (bool ok,) = address(m).call(abi.encodeCall(M.withdrawFloorFund, (address(a), to, amount)));
-        bool callerOk = caller == owner || (caller == creator && reg && !blocked);
+        (bool ok,) = address(m).call(abi.encodeCall(M.withdrawRoyaltyFund, (address(a), to, amount)));
+        bool callerOk = caller == owner || (caller == creator && !blocked && amount <= allowance);
         bool toOk = to == owner || to == creator;
-        assertEq(ok, callerOk && toOk, "withdraw allowed iff caller and recipient are allowed");
+        assertEq(ok, callerOk && toOk, "withdraw allowed iff caller, allowance and recipient allow it");
         if (ok) {
             assertEq(to.balance - toBefore, amount);
-            assertEq(m.floorFundOf(address(a)), held - amount);
+            assertEq(m.royaltyFundOf(address(a)), held - amount);
+            if (caller != owner && allowance != type(uint256).max) {
+                assertEq(m.creatorAllowance(address(a)), allowance - amount, "allowance reduced");
+            }
         } else {
-            assertEq(m.floorFundOf(address(a)), held);
+            assertEq(m.royaltyFundOf(address(a)), held);
         }
     }
 
-    /// F-8: the floor fund of an unregistered collection, including everything accrued BEFORE any
-    /// registration, can be taken by whoever the collection contract names as owner(), in two transactions:
-    /// self-register a royalty, then withdrawFloorFund to themselves. Per the header this is intended; it
-    /// means the floor fund is only as safe as each collection's owner() key, unless self-serve is blocked.
-    function test_F8_collectionOwnerCanSelfRegisterAndTakeTheFloorFund() public {
+    /// F-8 (fixed in 52655e7): a collection's owner() used to be able to self-register and take the whole
+    /// floor fund. Now the fees are owner-only, and the royalty fund only up to the allowance our owner sets.
+    function test_F8_fixed_creatorCannotTakeTheFunds() public {
         a.setOwner(creator);
-        vm.prank(seller);
-        m.list(address(a), _one(1), _one(1 ether), block.timestamp + 1 days);
-        vm.deal(buyer, 2 ether);
-        M.BuyItem[] memory items = new M.BuyItem[](1);
-        items[0] = M.BuyItem(address(a), 1, 1 ether);
-        vm.prank(buyer);
-        m.buy{value: 1.025 ether}(items, 0);
-        assertEq(m.floorFundOf(address(a)), 0.05 ether); // fee + royalty accrued while unregistered
+        _sellOne(a, 6);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether);
         vm.startPrank(creator);
-        m.registerRoyaltyAsCreator(address(a), creator, 0); // even a 0% registration is enough
-        m.withdrawFloorFund(address(a), creator, 0.05 ether);
+        m.registerRoyaltyAsCreator(address(a), creator, 0); // registering no longer unlocks anything
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, creator));
+        m.withdrawFloorFund(address(a), creator, 0.025 ether);
+        vm.expectRevert(M.NotAllowedToWithdraw.selector); // no allowance yet
+        m.withdrawRoyaltyFund(address(a), creator, 0.025 ether);
         vm.stopPrank();
-        assertEq(creator.balance, 0.05 ether);
-        assertEq(m.floorFundOf(address(a)), 0);
+        vm.prank(owner);
+        m.setCreatorAllowance(address(a), 0.01 ether);
+        vm.startPrank(creator);
+        vm.expectRevert(M.NotAllowedToWithdraw.selector); // over the allowance
+        m.withdrawRoyaltyFund(address(a), creator, 0.02 ether);
+        m.withdrawRoyaltyFund(address(a), creator, 0.01 ether);
+        vm.expectRevert(M.NotAllowedToWithdraw.selector); // allowance used up
+        m.withdrawRoyaltyFund(address(a), creator, 1);
+        vm.stopPrank();
+        assertEq(creator.balance, 0.01 ether);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether, "fees untouched");
     }
 
     /// Tips: accepted up to 5% of the items' cost (price + fee), refused above, and paid only to tipJar.
@@ -1834,7 +1964,8 @@ contract MarketplaceV3FuzzTest is Test {
         if (ok) {
             assertEq(a.ownerOf(1), buyer);
             assertEq(seller.balance, price, "seller got the full price");
-            assertEq(m.floorFundOf(address(a)), 0, "no fee and no royalty");
+            assertEq(m.floorFundOf(address(a)), 0, "no fee");
+            assertEq(m.royaltyFundOf(address(a)), 0, "no royalty");
             assertEq(m.privateBuyer(address(a), 1), address(0), "cleared after the sale");
         }
     }
@@ -1855,17 +1986,18 @@ contract MarketplaceV3FuzzTest is Test {
         assertEq(seller.balance, 10 ether); // the round trip cost the pair nothing
     }
 
-    /// F-14: since 9ac7a41 the buyer fee goes to the collection's floor fund, which a registered creator can
-    /// withdraw. A creator self-dealing in their own registered collection (two fresh wallets, royalty to a
-    /// third) gets the fee and the royalty back: the round trip costs 0 ETH, yet Sale.fee is a full 2.5%,
-    /// so a rebate of 80% of Sale.fee pays them 2% of the price in PC for free, at any size.
-    function test_F14_registeredCreatorWashTradesForFree() public {
+    /// F-14 (fixed in 52655e7): a registered creator wash-trading their own collection used to get the fee
+    /// back from the floor fund. Now the fee stays in a fund only our owner can withdraw, so the round trip
+    /// costs exactly the 2.5% fee, more than the 2% rebate (80% of Sale.fee) it earns.
+    function test_F14_fixed_creatorWashTradeStillPaysTheFee() public {
         address sellerW = makeAddr("creatorWalletA");
         address buyerW = makeAddr("creatorWalletB");
         InvNFT c = new InvNFT("C");
         c.setOwner(creator);
-        vm.prank(owner);
+        vm.startPrank(owner);
         m.setCollectionAllowed(address(c), true);
+        m.setCreatorAllowance(address(c), type(uint256).max); // even with an open royalty allowance
+        vm.stopPrank();
         vm.prank(creator);
         m.registerRoyaltyAsCreator(address(c), creator, 1000); // royalty to a third wallet of theirs
         c.mint(sellerW, 1);
@@ -1878,17 +2010,34 @@ contract MarketplaceV3FuzzTest is Test {
         m.list(address(c), _one(1), _one(10 ether), block.timestamp + 1 days);
         M.BuyItem[] memory items = new M.BuyItem[](1);
         items[0] = M.BuyItem(address(c), 1, 10 ether);
-        vm.expectEmit(true, true, true, true, address(m));
-        emit M.Sale(address(c), 1, sellerW, buyerW, 10 ether, 0.25 ether, 1 ether, 0); // fee 0.25 -> rebate basis
         vm.prank(buyerW);
         m.buy{value: 10.25 ether}(items, 0);
-        uint256 fund = m.floorFundOf(address(c));
-        assertEq(fund, 0.25 ether, "the fee sits in the creator-withdrawable floor fund");
+        assertEq(m.floorFundOf(address(c)), 0.25 ether);
         vm.prank(creator);
-        m.withdrawFloorFund(address(c), creator, fund); // the fee comes back
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, creator));
+        m.withdrawFloorFund(address(c), creator, 0.25 ether);
+        vm.prank(creator);
+        vm.expectRevert(M.AmountTooHigh.selector); // the royalty fund is empty: registered royalties are pushed
+        m.withdrawRoyaltyFund(address(c), creator, 0.25 ether);
 
-        assertEq(sellerW.balance + buyerW.balance + creator.balance, groupBefore, "round trip cost 0 ETH");
-        assertEq(c.ownerOf(1), buyerW);
+        uint256 groupAfter = sellerW.balance + buyerW.balance + creator.balance;
+        assertEq(groupBefore - groupAfter, 0.25 ether, "the round trip costs exactly the fee");
+        assertGt(groupBefore - groupAfter, (0.25 ether * 80) / 100, "more than the 80%-of-fee rebate it earns");
+    }
+
+    /// F-15: creatorAllowance belongs to the collection, not to the wallet it was agreed with. If the collection
+    /// contract's owner() changes (ownership sold, transferred or compromised), the new owner() inherits whatever
+    /// is left of the allowance, an open one included.
+    function test_F15_allowanceFollowsTheCollectionOwner() public {
+        a.setOwner(creator);
+        _sellOne(a, 6);
+        vm.prank(owner);
+        m.setCreatorAllowance(address(a), type(uint256).max); // agreed with `creator`
+        address newOwner = makeAddr("newCollectionOwner");
+        a.setOwner(newOwner); // the collection contract changes hands
+        vm.prank(newOwner);
+        m.withdrawRoyaltyFund(address(a), newOwner, 0.025 ether);
+        assertEq(newOwner.balance, 0.025 ether);
     }
 
     /// F-5 (fixed): renounceOwnership is disabled, so the marketplace can never become ownerless.
@@ -1916,8 +2065,9 @@ contract MarketplaceV3PropertyHarness is Handler {
             pend += m.pendingPayouts(tracked[i]);
         }
         for (uint256 c; c < 3; ++c) {
-            pend += m.floorFundOf(address(nfts[c]));
+            pend += m.floorFundOf(address(nfts[c])) + m.royaltyFundOf(address(nfts[c]));
             if (m.floorFundOf(address(nfts[c])) != gFloorFund[address(nfts[c])]) return false;
+            if (m.royaltyFundOf(address(nfts[c])) != gRoyFund[address(nfts[c])]) return false;
         }
         return address(m).balance == esc + pend && esc == ghostEscrow;
     }
@@ -1936,6 +2086,23 @@ contract MarketplaceV3PropertyHarness is Handler {
 
     function property_capsHold() external view returns (bool) {
         return _capsOk();
+    }
+
+    function _allowanceOk() internal view returns (bool) {
+        for (uint256 c; c < 3; ++c) {
+            address col = address(nfts[c]);
+            if (m.creatorAllowance(col) != gAllowance[col]) return false;
+            if (gAllowanceSet[col] != type(uint256).max && gCreatorTaken[col] > gAllowanceSet[col]) return false;
+        }
+        return true;
+    }
+
+    function property_creatorAllowanceNeverExceeded() external view returns (bool) {
+        return _allowanceOk();
+    }
+
+    function echidna_creatorAllowanceNeverExceeded() external view returns (bool) {
+        return _allowanceOk();
     }
 
     function echidna_balanceEqualsEscrowPlusPending() external view returns (bool) {
@@ -2018,10 +2185,11 @@ contract MarketplaceV3SymbolicTest is Test {
         items[0] = M.BuyItem(address(a), 1, price);
         vm.prank(buyer);
         m.buy{value: value}(items, 0);
-        uint256 floor = m.floorFundOf(address(a));
+        uint256 floor = m.floorFundOf(address(a)) + m.royaltyFundOf(address(a));
+        assert(m.floorFundOf(address(a)) == fee); // the fee, and only the fee, in the floor fund
         assert(a.ownerOf(1) == buyer);
         assert(buyer.balance == over);
-        // seller + royalty receiver + floor fund == everything the buyer paid
+        // seller + royalty receiver + floor fund + royalty fund == everything the buyer paid
         assert(seller.balance + creator.balance + floor == uint256(price) + fee);
         // the seller loses at most the 10% royalty cap
         assert((uint256(price) - seller.balance) * 10_000 <= uint256(price) * 1000);
@@ -2048,7 +2216,7 @@ contract MarketplaceV3SymbolicTest is Test {
             vm.prank(bidder);
             m.cancelOffer(oid);
         }
-        assert(address(m).balance == m.floorFundOf(address(a)));
+        assert(address(m).balance == m.floorFundOf(address(a)) + m.royaltyFundOf(address(a)));
         assert(bidder.balance == unit * (qty - filled));
     }
 
@@ -2097,10 +2265,10 @@ contract MarketplaceV3SymbolicTest is Test {
         }
     }
 
-    /// ANY single call by ANY sender, with any calldata and value: a collection's floor fund only decreases
-    /// by an amount that our owner or the collection's owner() received, and only our owner or the
-    /// (registered) collection owner can make it decrease.
-    function check_floorFundOnlyLeavesToAllowed(uint256 value, bool reg) public {
+    /// ANY single call by ANY sender, with any calldata and value: the floor fund (fees) only decreases when our
+    /// owner calls; the royalty fund only decreases when our owner calls, or the collection's owner() within its
+    /// allowance, and then the whole decrease reaches our owner or the collection's owner().
+    function check_floorFundOnlyLeavesToAllowed(uint256 value, bool allow) public {
         a.setOwner(creator);
         vm.deal(owner, 0);
         vm.deal(creator, 0);
@@ -2112,11 +2280,12 @@ contract MarketplaceV3SymbolicTest is Test {
         items[0] = M.BuyItem(address(a), 1, 1 ether);
         vm.prank(buyer);
         m.buy{value: 1.025 ether}(items, 0);
-        if (reg) {
-            vm.prank(creator);
-            m.registerRoyaltyAsCreator(address(a), creator, 500);
+        if (allow) {
+            vm.prank(owner);
+            m.setCreatorAllowance(address(a), 0.01 ether);
         }
-        uint256 held = m.floorFundOf(address(a));
+        uint256 floorBefore = m.floorFundOf(address(a));
+        uint256 royBefore = m.royaltyFundOf(address(a));
 
         address sender = svm.createAddress("sender");
         vm.assume(sender != address(0) && sender != address(m));
@@ -2128,12 +2297,14 @@ contract MarketplaceV3SymbolicTest is Test {
         (bool ok,) = address(m).call{value: value}(data);
         ok;
 
-        uint256 after_ = m.floorFundOf(address(a));
-        assert(after_ <= held); // nothing in a single call can add to it (no sale of collection a is possible)
-        if (after_ < held) {
-            assert(sender == owner || (reg && sender == creator));
-            // withdrawFloorFund is not payable, so the whole decrease must have reached owner / creator
-            assert(owner.balance + creator.balance - before == held - after_);
+        uint256 floorAfter = m.floorFundOf(address(a));
+        uint256 royAfter = m.royaltyFundOf(address(a));
+        assert(floorAfter <= floorBefore && royAfter <= royBefore); // no sale of collection a is possible
+        if (floorAfter < floorBefore) assert(sender == owner);
+        if (royAfter < royBefore) {
+            assert(sender == owner || (allow && sender == creator && royBefore - royAfter <= 0.01 ether));
+            // withdrawRoyaltyFund is not payable, so the whole decrease must reach our owner / the creator
+            if (floorAfter == floorBefore) assert(owner.balance + creator.balance - before == royBefore - royAfter);
         }
     }
 
@@ -2168,8 +2339,9 @@ contract MarketplaceV3SymbolicTest is Test {
         (bool ok6,) = address(m).call(abi.encodeCall(M.refundOffers, (_one(1))));
         (bool ok7,) = address(m).call(abi.encodeCall(M.setCollectionAllowed, (address(a), false)));
         (bool ok8,) = address(m).call(abi.encodeCall(M.setTipJar, (caller)));
+        (bool ok9,) = address(m).call(abi.encodeCall(M.setCreatorAllowance, (address(a), type(uint256).max)));
         vm.stopPrank();
-        assert(!ok1 && !ok2 && !ok3 && !ok4 && !ok5 && !ok6 && !ok7 && !ok8);
+        assert(!ok1 && !ok2 && !ok3 && !ok4 && !ok5 && !ok6 && !ok7 && !ok8 && !ok9);
     }
 }
 
