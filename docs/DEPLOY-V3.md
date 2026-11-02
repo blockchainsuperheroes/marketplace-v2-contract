@@ -5,7 +5,7 @@ A professional audit comes before third-party collections are allowed.
 
 ## Decide before deploying (nftprof)
 
-- [x] **No treasury** (nftprof, 2026-11-02): the 2.5% buyer fee goes to the collection’s floor fund. **Tip jar** (buyer tips, NFTC liquidity): 0xB2e3 for now.
+- [x] **No treasury** (nftprof, 2026-11-02): the 1% buyer fee goes to the collection’s fee fund; the default royalty is 0.5%. **Tip jar** (optional buyer tips, the only NFTC liquidity source at launch; no fixed fee share): 0xB2e3 for now.
 - [x] Two funds per collection, held in the contract (nftprof, 2026-11-02; closes audit F-14 / F-8):
   - `floorFundOf` = the buyer fee. Only 0xB2e3 withdraws it (`withdrawFloorFund`, to any wallet) to buy
     that collection's floor, here or on other marketplaces. The creator can never withdraw it.
@@ -36,7 +36,7 @@ forge script script/DeployMarketplaceV3.s.sol --rpc-url $ETH_RPC --broadcast --v
 1. 0xB2e3 calls `acceptOwnership()`. Until then the deployer is still the owner, so do it immediately.
 2. Check on Etherscan:
    - `owner()` is 0xB2e3 and `pendingOwner()` is 0;
-   - `feeBps()` is 250 and `defaultRoyaltyBps()` is 250;
+   - `feeBps()` is 100 (1% buyer fee) and `defaultRoyaltyBps()` is 50 (0.5%), per nftprof 2026-11-02;
    - `tipJar()` is right and `guardian()` is 0 (the role exists, unassigned);
    - `collectionAllowed()` is true for each launch collection;
    - `royaltyFor()` is right for each.

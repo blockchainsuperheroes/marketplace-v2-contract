@@ -13,8 +13,8 @@ contract DeployMarketplaceV3 is Script {
     function run() external {
         address owner = vm.envOr("OWNER", address(0xB2e3e82a95f5c4c47E30A5b420Ac4f99d32EF61f));
         address tipJar = vm.envAddress("TIP_JAR");
-        uint16 feeBps = uint16(vm.envOr("FEE_BPS", uint256(250)));
-        uint16 royaltyBps = uint16(vm.envOr("DEFAULT_ROYALTY_BPS", uint256(250)));
+        uint16 feeBps = uint16(vm.envOr("FEE_BPS", uint256(100)));
+        uint16 royaltyBps = uint16(vm.envOr("DEFAULT_ROYALTY_BPS", uint256(50)));
         address[] memory collections = vm.envOr("COLLECTIONS", ",", new address[](0));
         address[] memory rc = vm.envOr("ROYALTY_COLLECTIONS", ",", new address[](0));
         address[] memory rr = vm.envOr("ROYALTY_RECEIVERS", ",", new address[](0));
