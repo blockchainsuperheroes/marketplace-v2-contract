@@ -103,8 +103,8 @@ contract MarketplaceV3Test is Test {
 
         assertEq(a.ownerOf(1), buyer);
         assertEq(alice.balance, 0.975 ether); // price − 2.5% royalty; seller pays no fee
-        assertEq(treasury.balance, 0.025 ether); // 2.5% buyer fee
-        assertEq(m.floorFundOf(address(a)), 0.025 ether); // unregistered collection → floor fund
+        assertEq(treasury.balance, 0); // nothing to us
+        assertEq(m.floorFundOf(address(a)), 0.05 ether); // 2.5% fee + 2.5% unregistered royalty → floor fund
         assertEq(buyer.balance, 100 ether - 1.025 ether);
         (address seller,,,,,) = m.listings(address(a), 1);
         assertEq(seller, address(0));
@@ -133,7 +133,7 @@ contract MarketplaceV3Test is Test {
         m.buy{value: 3.075 ether}(items, 0);
         assertEq(a.ownerOf(1), buyer);
         assertEq(a.ownerOf(2), buyer);
-        assertEq(treasury.balance, 0.075 ether);
+        assertEq(m.floorFundOf(address(a)), 0.15 ether); // fees + royalties
     }
 
     function test_zombieListing_isClearedAndCannotComeBack() public {
@@ -231,13 +231,11 @@ contract MarketplaceV3Test is Test {
         m.setDefaultRoyalty(1000);
         vm.stopPrank();
         _buy(buyer, a, 1, 1 ether, 1.025 ether); // still 2.5% fee
-        assertEq(treasury.balance, 0.025 ether);
-        assertEq(m.floorFundOf(address(a)), 0.025 ether); // still 2.5% royalty
+        assertEq(m.floorFundOf(address(a)), 0.05 ether); // still 2.5% fee + 2.5% royalty
 
         _list(alice, a, 2, 1 ether); // new listing takes the new rates
         _buy(buyer, a, 2, 1 ether, 1.05 ether);
-        assertEq(treasury.balance, 0.075 ether);
-        assertEq(m.floorFundOf(address(a)), 0.125 ether);
+        assertEq(m.floorFundOf(address(a)), 0.2 ether); // + 5% fee + 10% royalty
     }
 
     function test_caps() public {
@@ -264,7 +262,7 @@ contract MarketplaceV3Test is Test {
         _list(alice, a, 1, 1 ether);
         _buy(buyer, a, 1, 1 ether, 1.025 ether);
         assertEq(creator.balance, 0.05 ether);
-        assertEq(m.floorFundOf(address(a)), 0);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether); // the fee still goes to the collection
         assertEq(alice.balance, 0.95 ether);
 
         vm.prank(owner);
@@ -341,7 +339,7 @@ contract MarketplaceV3Test is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         m.registerRoyalty(address(a), alice, 1000);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        m.setTreasury(alice);
+        m.setTipJar(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         m.setCollectionAllowed(address(a), false);
         vm.expectRevert(PentagonMarketplaceV3.NotGuardian.selector);
@@ -360,8 +358,8 @@ contract MarketplaceV3Test is Test {
         c.setApprovalForAll(address(m), true);
         _list(alice, MockNFT(address(c)), 1, 1 ether);
         _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-        assertEq(m.floorFundOf(address(c)), 0.025 ether);
-        assertEq(address(m).balance, 0.025 ether);
+        assertEq(m.floorFundOf(address(c)), 0.05 ether);
+        assertEq(address(m).balance, 0.05 ether);
 
         vm.prank(creator); // not registered yet: the collection owner can't withdraw
         vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
@@ -377,7 +375,7 @@ contract MarketplaceV3Test is Test {
         vm.stopPrank();
         assertEq(owner.balance, 0.01 ether);
         assertEq(creator.balance, 0.005 ether);
-        assertEq(m.floorFundOf(address(c)), 0.01 ether);
+        assertEq(m.floorFundOf(address(c)), 0.035 ether);
     }
 
     function test_floorFund_creatorCanWithdrawOnceRegistered_toOwnerAddressesOnly() public {
@@ -396,8 +394,8 @@ contract MarketplaceV3Test is Test {
         vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector);
         m.withdrawFloorFund(address(c), carol, 0.025 ether);
         vm.prank(creator);
-        m.withdrawFloorFund(address(c), creator, 0.025 ether);
-        assertEq(creator.balance, 0.025 ether);
+        m.withdrawFloorFund(address(c), creator, 0.05 ether);
+        assertEq(creator.balance, 0.05 ether);
         assertEq(m.floorFundOf(address(c)), 0);
 
         vm.prank(alice); // strangers never
@@ -428,7 +426,6 @@ contract MarketplaceV3Test is Test {
         _buy(buyer, a, 1, 1 ether, 1 ether); // exactly the price: no fee
         assertEq(a.ownerOf(1), buyer);
         assertEq(alice.balance, 1 ether); // no royalty either
-        assertEq(treasury.balance, 0);
         assertEq(m.floorFundOf(address(a)), 0);
         assertEq(m.privateBuyer(address(a), 1), address(0));
     }
@@ -451,7 +448,7 @@ contract MarketplaceV3Test is Test {
         vm.deal(carol, 5 ether);
         _buy(carol, a, 1, 1 ether, 1.025 ether);
         assertEq(a.ownerOf(1), carol);
-        assertEq(treasury.balance, 0.025 ether);
+        assertEq(m.floorFundOf(address(a)), 0.05 ether);
     }
 
     function test_tip_goesToTipJar_cappedAt5Percent() public {
@@ -471,7 +468,7 @@ contract MarketplaceV3Test is Test {
         m.buy{value: 1.05 ether}(items, 0.05 ether);
         assertEq(jar.balance, 0.05 ether);
         assertEq(alice.balance, 1 ether); // the seller still gets the full price
-        assertEq(treasury.balance, 0);
+        assertEq(m.floorFundOf(address(a)), 0); // a private sale pays no fee
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
@@ -507,7 +504,7 @@ contract MarketplaceV3Test is Test {
         vm.prank(creator);
         m.registerRoyaltyAsCreator(address(c), address(0), 0); // removed: back to the 2.5% default
         _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-        assertEq(m.floorFundOf(address(c)), 0.025 ether); // not the frozen 10%
+        assertEq(m.floorFundOf(address(c)), 0.05 ether); // not the frozen 10%
         assertEq(alice.balance, 0.975 ether);
     }
 
@@ -573,15 +570,14 @@ contract MarketplaceV3Test is Test {
         m.acceptOffer(id, _ids(3), new bytes32[][](0));
         assertEq(a.ownerOf(3), buyer);
         assertEq(alice.balance, 0.975 ether);
-        assertEq(treasury.balance, 0.025 ether);
-        assertEq(m.floorFundOf(address(a)), 0.025 ether);
-        assertEq(address(m).balance, 1.025 ether + 0.025 ether); // one fill left + the floor fund
+        assertEq(m.floorFundOf(address(a)), 0.05 ether);
+        assertEq(address(m).balance, 1.025 ether + 0.05 ether); // one fill left + the floor fund
 
         uint256 before = buyer.balance;
         vm.prank(buyer);
         m.cancelOffer(id);
         assertEq(buyer.balance, before + 1.025 ether);
-        assertEq(address(m).balance, 0.025 ether); // only the floor fund is left
+        assertEq(address(m).balance, 0.05 ether); // only the floor fund is left
     }
 
     function test_offer_cannotOverfill() public {
