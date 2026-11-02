@@ -100,6 +100,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => uint256) public royaltyFundOf;
     /// How much of royaltyFundOf the collection's owner() may withdraw; type(uint256).max = open.
     mapping(address => uint256) public creatorAllowance;
+    /// The owner() wallet the allowance was granted to; only it may use the allowance.
+    mapping(address => address) public creatorAllowanceHolder;
 
     address public guardian; // may pause (never unpause); 0 = owner only
     address public tipJar; // where buyer tips go (NFTC liquidity)
@@ -124,7 +126,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event DefaultRoyaltySet(uint256 bps);
     event FloorFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
     event RoyaltyFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
-    event CreatorAllowanceSet(address indexed collection, uint256 amount);
+    event CreatorAllowanceSet(address indexed collection, address indexed holder, uint256 amount);
     event GuardianSet(address guardian);
     event TipJarSet(address tipJar);
     event Tipped(address indexed buyer, uint256 amount);
@@ -420,10 +422,14 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// Let the collection's owner() withdraw up to `amount` of its royalty fund (replaces any earlier
-    /// allowance; type(uint256).max = open, 0 = none).
+    /// allowance; type(uint256).max = open, 0 = none). The allowance belongs to the wallet that is the
+    /// owner() now: if the collection changes hands, the new owner() starts with nothing (audit F-15).
     function setCreatorAllowance(address collection, uint256 amount) external onlyOwner {
+        address holder = collectionOwner(collection);
+        if (amount != 0 && holder == address(0)) revert NotCollectionOwner();
         creatorAllowance[collection] = amount;
-        emit CreatorAllowanceSet(collection, amount);
+        creatorAllowanceHolder[collection] = holder;
+        emit CreatorAllowanceSet(collection, holder, amount);
     }
 
     /// Withdraw a collection's unregistered royalties. Callers: our owner always; the collection's
@@ -432,7 +438,10 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     function withdrawRoyaltyFund(address collection, address to, uint256 amount) external nonReentrant {
         address cOwner = collectionOwner(collection);
         if (msg.sender != owner()) {
-            if (cOwner == address(0) || msg.sender != cOwner || selfServeBlocked[collection]) {
+            if (
+                cOwner == address(0) || msg.sender != cOwner || msg.sender != creatorAllowanceHolder[collection]
+                    || selfServeBlocked[collection]
+            ) {
                 revert NotAllowedToWithdraw();
             }
             uint256 allowance = creatorAllowance[collection];

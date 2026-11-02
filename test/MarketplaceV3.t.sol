@@ -16,6 +16,7 @@ contract OwnedNFT is ERC721 {
     address public owner;
     constructor(address o) ERC721("O", "O") { owner = o; }
     function mint(address to, uint256 id) external { _mint(to, id); }
+    function setOwner(address o) external { owner = o; }
 }
 
 /// A seller wallet that rejects payments until told to accept them (e.g. a smart wallet with no receive()).
@@ -464,6 +465,31 @@ contract MarketplaceV3Test is Test {
         vm.prank(creator);
         vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
         m.withdrawRoyaltyFund(address(c), creator, 1);
+    }
+
+    function test_F15_allowanceStaysWithTheWalletItWasGrantedTo() public {
+        OwnedNFT c = _soldOwnedCollection();
+        vm.prank(owner);
+        m.setCreatorAllowance(address(c), type(uint256).max);
+        assertEq(m.creatorAllowanceHolder(address(c)), creator);
+
+        c.setOwner(carol); // the collection changes hands
+        vm.prank(carol); // the new owner() inherits nothing
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(c), carol, 1);
+        vm.prank(creator); // and the old one is no longer owner()
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(c), creator, 1);
+
+        vm.prank(owner); // we grant the new owner explicitly
+        m.setCreatorAllowance(address(c), 0.01 ether);
+        vm.prank(carol);
+        m.withdrawRoyaltyFund(address(c), carol, 0.01 ether);
+        assertEq(carol.balance, 0.01 ether);
+
+        vm.prank(owner); // no owner() wallet: nothing to grant to
+        vm.expectRevert(PentagonMarketplaceV3.NotCollectionOwner.selector);
+        m.setCreatorAllowance(address(a), 1 ether);
     }
 
     function test_F14_creatorWashTrade_stillPaysTheFee() public {
