@@ -19,10 +19,14 @@ interface IOwnableCollection {
 /// Rules, in one place:
 /// - Fee: buyer side only, hard-capped at 5%, and it goes to the collection's floor fund, not to us. Royalty: our registry only; a collection's own ERC-2981
 ///   is ignored. Capped at 10%. Both rates are frozen into each listing / offer when it is made.
-/// - Floor fund: collections nobody has registered pay the default royalty into a balance HELD HERE per
-///   collection (floorFundOf). Our owner withdraws it (to buy that collection's floor NFTs for Redeem).
-///   Once the collection is registered, its owner() wallet may withdraw it too. Either way it can only
-///   go to our owner or to the collection's owner().
+/// - Two balances are HELD HERE per collection (nftprof 2026-11-02):
+///   - floorFundOf: the fee. Only our owner withdraws it, to any wallet, to buy that collection's floor
+///     NFTs (here or on other marketplaces) for Redeem. The creator can never withdraw it, so a creator
+///     wash-trading their own collection still pays the fee (audit F-14).
+///   - royaltyFundOf: the default royalty of collections nobody has registered. Our owner withdraws it to
+///     itself or the collection's owner(). The collection's owner() can withdraw only what our owner has
+///     approved for it (creatorAllowance), after agreeing with us what it is for; an active creator can
+///     be given an open allowance.
 /// - Who registers a royalty: the collection's own owner() (self-serve, on our site), or our owner.
 ///   Our owner can override any registration and block self-serve for a collection (disputes,
 ///   renounced or wrong owner()).
@@ -40,7 +44,7 @@ interface IOwnableCollection {
 /// - Offers name one collection and are only filled with that collection's tokens. An offer may
 ///   restrict which tokens fill it with a Merkle root of token ids (trait offers, single-item offers).
 /// - Payouts are pushed with a gas limit; if a receiver rejects them they are kept for withdraw().
-/// - Owner powers: fee, royalties, tip jar, floor-fund withdrawals (above), which collections trade, pause / unpause,
+/// - Owner powers: fee, royalties, tip jar, floor- and royalty-fund withdrawals and creator allowances (above), which collections trade, pause / unpause,
 ///   naming a guardian (a hot key that can only pause), and, while paused, refunding offers to their
 ///   bidders. The owner can never move anyone's NFT or money elsewhere.
 contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
@@ -90,8 +94,12 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => bool) public selfServeBlocked;
     /// collection => tokenId => the only wallet allowed to buy that listing (0 = anyone)
     mapping(address => mapping(uint256 => address)) public privateBuyer;
-    /// Unregistered royalties held per collection (see the header).
+    /// Fees held per collection, for floor buys (see the header).
     mapping(address => uint256) public floorFundOf;
+    /// Unregistered royalties held per collection (see the header).
+    mapping(address => uint256) public royaltyFundOf;
+    /// How much of royaltyFundOf the collection's owner() may withdraw; type(uint256).max = open.
+    mapping(address => uint256) public creatorAllowance;
 
     address public guardian; // may pause (never unpause); 0 = owner only
     address public tipJar; // where buyer tips go (NFTC liquidity)
@@ -115,6 +123,8 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     event SelfServeBlocked(address indexed collection, bool blocked);
     event DefaultRoyaltySet(uint256 bps);
     event FloorFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
+    event RoyaltyFundWithdrawn(address indexed collection, address indexed to, uint256 amount, address indexed by);
+    event CreatorAllowanceSet(address indexed collection, uint256 amount);
     event GuardianSet(address guardian);
     event TipJarSet(address tipJar);
     event Tipped(address indexed buyer, uint256 amount);
@@ -349,7 +359,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     function royaltyFor(address collection) public view returns (address receiver, uint256 bps, bool registered) {
         Royalty memory r = registeredRoyalty[collection];
         if (r.receiver != address(0)) return (r.receiver, r.bps, true);
-        return (address(this), defaultRoyaltyBps, false); // held in floorFundOf[collection]
+        return (address(this), defaultRoyaltyBps, false); // held in royaltyFundOf[collection]
     }
 
     // ───────────────────────────── Admin ─────────────────────────────
@@ -398,20 +408,43 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
 
-    /// Withdraw a collection's floor fund. Callers: our owner always; the collection's owner() wallet
-    /// once the collection has a registered royalty (and self-serve isn't blocked). Recipient: our
-    /// owner or the collection's owner(), nobody else.
-    function withdrawFloorFund(address collection, address to, uint256 amount) external nonReentrant {
-        address cOwner = collectionOwner(collection);
-        bool creator = cOwner != address(0) && msg.sender == cOwner
-            && registeredRoyalty[collection].receiver != address(0) && !selfServeBlocked[collection];
-        if (msg.sender != owner() && !creator) revert NotAllowedToWithdraw();
-        if (to != owner() && (cOwner == address(0) || to != cOwner)) revert BadRecipient();
+    /// Withdraw a collection's fees to buy its floor NFTs. Our owner only; to any wallet (e.g. the one
+    /// that buys on other marketplaces).
+    function withdrawFloorFund(address collection, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert BadRecipient();
         if (amount == 0 || amount > floorFundOf[collection]) revert AmountTooHigh();
         floorFundOf[collection] -= amount;
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert WithdrawFailed();
         emit FloorFundWithdrawn(collection, to, amount, msg.sender);
+    }
+
+    /// Let the collection's owner() withdraw up to `amount` of its royalty fund (replaces any earlier
+    /// allowance; type(uint256).max = open, 0 = none).
+    function setCreatorAllowance(address collection, uint256 amount) external onlyOwner {
+        creatorAllowance[collection] = amount;
+        emit CreatorAllowanceSet(collection, amount);
+    }
+
+    /// Withdraw a collection's unregistered royalties. Callers: our owner always; the collection's
+    /// owner() wallet up to its allowance (and while self-serve isn't blocked). Recipient: our owner or
+    /// the collection's owner(), nobody else.
+    function withdrawRoyaltyFund(address collection, address to, uint256 amount) external nonReentrant {
+        address cOwner = collectionOwner(collection);
+        if (msg.sender != owner()) {
+            if (cOwner == address(0) || msg.sender != cOwner || selfServeBlocked[collection]) {
+                revert NotAllowedToWithdraw();
+            }
+            uint256 allowance = creatorAllowance[collection];
+            if (amount > allowance) revert NotAllowedToWithdraw();
+            if (allowance != type(uint256).max) creatorAllowance[collection] = allowance - amount;
+        }
+        if (to != owner() && (cOwner == address(0) || to != cOwner)) revert BadRecipient();
+        if (amount == 0 || amount > royaltyFundOf[collection]) revert AmountTooHigh();
+        royaltyFundOf[collection] -= amount;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit RoyaltyFundWithdrawn(collection, to, amount, msg.sender);
     }
 
     /// Disabled: an ownerless marketplace would strand floor funds and lose unpause and refunds.
@@ -483,7 +516,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable {
         if (fee > 0) floorFundOf[collection] += fee;
         if (royalty > 0) {
             if (registered) _pay(receiver, royalty);
-            else floorFundOf[collection] += royalty;
+            else royaltyFundOf[collection] += royalty;
             emit RoyaltyPaid(collection, tokenId, receiver, royalty, registered);
         }
         _pay(seller, price - royalty);

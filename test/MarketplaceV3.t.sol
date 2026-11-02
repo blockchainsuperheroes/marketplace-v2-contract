@@ -104,7 +104,8 @@ contract MarketplaceV3Test is Test {
         assertEq(a.ownerOf(1), buyer);
         assertEq(alice.balance, 0.975 ether); // price − 2.5% royalty; seller pays no fee
         assertEq(treasury.balance, 0); // nothing to us
-        assertEq(m.floorFundOf(address(a)), 0.05 ether); // 2.5% fee + 2.5% unregistered royalty → floor fund
+        assertEq(m.floorFundOf(address(a)), 0.025 ether); // 2.5% fee → floor fund
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether); // 2.5% unregistered royalty → royalty fund
         assertEq(buyer.balance, 100 ether - 1.025 ether);
         (address seller,,,,,) = m.listings(address(a), 1);
         assertEq(seller, address(0));
@@ -133,7 +134,8 @@ contract MarketplaceV3Test is Test {
         m.buy{value: 3.075 ether}(items, 0);
         assertEq(a.ownerOf(1), buyer);
         assertEq(a.ownerOf(2), buyer);
-        assertEq(m.floorFundOf(address(a)), 0.15 ether); // fees + royalties
+        assertEq(m.floorFundOf(address(a)), 0.075 ether); // fees
+        assertEq(m.royaltyFundOf(address(a)), 0.075 ether); // royalties
     }
 
     function test_zombieListing_isClearedAndCannotComeBack() public {
@@ -231,11 +233,13 @@ contract MarketplaceV3Test is Test {
         m.setDefaultRoyalty(1000);
         vm.stopPrank();
         _buy(buyer, a, 1, 1 ether, 1.025 ether); // still 2.5% fee
-        assertEq(m.floorFundOf(address(a)), 0.05 ether); // still 2.5% fee + 2.5% royalty
+        assertEq(m.floorFundOf(address(a)), 0.025 ether); // still 2.5% fee
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether); // and 2.5% royalty
 
         _list(alice, a, 2, 1 ether); // new listing takes the new rates
         _buy(buyer, a, 2, 1 ether, 1.05 ether);
-        assertEq(m.floorFundOf(address(a)), 0.2 ether); // + 5% fee + 10% royalty
+        assertEq(m.floorFundOf(address(a)), 0.075 ether); // + 5% fee
+        assertEq(m.royaltyFundOf(address(a)), 0.125 ether); // + 10% royalty
     }
 
     function test_caps() public {
@@ -349,8 +353,8 @@ contract MarketplaceV3Test is Test {
         vm.stopPrank();
     }
 
-    function test_floorFund_heldPerCollection_onlyOwnerBeforeRegistration() public {
-        OwnedNFT c = new OwnedNFT(creator);
+    function _soldOwnedCollection() internal returns (OwnedNFT c) {
+        c = new OwnedNFT(creator);
         vm.prank(owner);
         m.setCollectionAllowed(address(c), true);
         c.mint(alice, 1);
@@ -358,60 +362,129 @@ contract MarketplaceV3Test is Test {
         c.setApprovalForAll(address(m), true);
         _list(alice, MockNFT(address(c)), 1, 1 ether);
         _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-        assertEq(m.floorFundOf(address(c)), 0.05 ether);
+    }
+
+    function test_floorFund_feesHeldPerCollection_onlyOwnerWithdraws_anyWallet() public {
+        OwnedNFT c = _soldOwnedCollection();
+        assertEq(m.floorFundOf(address(c)), 0.025 ether);
+        assertEq(m.royaltyFundOf(address(c)), 0.025 ether);
         assertEq(address(m).balance, 0.05 ether);
 
-        vm.prank(creator); // not registered yet: the collection owner can't withdraw
-        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        vm.prank(creator); // never the creator, even registered and approved (audit F-14)
+        m.registerRoyaltyAsCreator(address(c), creator, 500);
+        vm.prank(owner);
+        m.setCreatorAllowance(address(c), type(uint256).max);
+        vm.prank(creator);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, creator));
         m.withdrawFloorFund(address(c), creator, 0.01 ether);
 
         vm.startPrank(owner);
-        vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector); // only to us or the collection owner
-        m.withdrawFloorFund(address(c), carol, 0.01 ether);
+        vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector);
+        m.withdrawFloorFund(address(c), address(0), 0.01 ether);
         vm.expectRevert(PentagonMarketplaceV3.AmountTooHigh.selector);
         m.withdrawFloorFund(address(c), owner, 1 ether);
-        m.withdrawFloorFund(address(c), owner, 0.01 ether); // to us (to buy floor NFTs)
-        m.withdrawFloorFund(address(c), creator, 0.005 ether); // or on the creator's behalf
+        m.withdrawFloorFund(address(c), carol, 0.02 ether); // e.g. the wallet that buys floor elsewhere
+        vm.stopPrank();
+        assertEq(carol.balance, 0.02 ether);
+        assertEq(m.floorFundOf(address(c)), 0.005 ether);
+        assertEq(m.royaltyFundOf(address(c)), 0.025 ether); // untouched
+    }
+
+    function test_royaltyFund_ownerWithdraws_toUsOrCollectionOwnerOnly() public {
+        OwnedNFT c = _soldOwnedCollection();
+        vm.startPrank(owner);
+        vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector);
+        m.withdrawRoyaltyFund(address(c), carol, 0.01 ether);
+        vm.expectRevert(PentagonMarketplaceV3.AmountTooHigh.selector);
+        m.withdrawRoyaltyFund(address(c), owner, 1 ether);
+        m.withdrawRoyaltyFund(address(c), owner, 0.01 ether);
+        m.withdrawRoyaltyFund(address(c), creator, 0.005 ether); // on the creator's behalf
         vm.stopPrank();
         assertEq(owner.balance, 0.01 ether);
         assertEq(creator.balance, 0.005 ether);
-        assertEq(m.floorFundOf(address(c)), 0.035 ether);
+        assertEq(m.royaltyFundOf(address(c)), 0.01 ether);
+        assertEq(m.floorFundOf(address(c)), 0.025 ether); // untouched
     }
 
-    function test_floorFund_creatorCanWithdrawOnceRegistered_toOwnerAddressesOnly() public {
-        OwnedNFT c = new OwnedNFT(creator);
-        vm.prank(owner);
-        m.setCollectionAllowed(address(c), true);
-        c.mint(alice, 1);
-        vm.prank(alice);
-        c.setApprovalForAll(address(m), true);
-        _list(alice, MockNFT(address(c)), 1, 1 ether);
-        _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-
+    function test_royaltyFund_creatorNeedsOurAllowance_evenWhenRegistered() public {
+        OwnedNFT c = _soldOwnedCollection();
         vm.prank(creator);
         m.registerRoyaltyAsCreator(address(c), creator, 500);
         vm.prank(creator);
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(c), creator, 0.01 ether);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        m.setCreatorAllowance(address(c), 1 ether);
+
+        vm.prank(owner); // agreed purpose: 0.015
+        m.setCreatorAllowance(address(c), 0.015 ether);
+        vm.startPrank(creator);
         vm.expectRevert(PentagonMarketplaceV3.BadRecipient.selector);
-        m.withdrawFloorFund(address(c), carol, 0.025 ether);
-        vm.prank(creator);
-        m.withdrawFloorFund(address(c), creator, 0.05 ether);
-        assertEq(creator.balance, 0.05 ether);
-        assertEq(m.floorFundOf(address(c)), 0);
+        m.withdrawRoyaltyFund(address(c), carol, 0.01 ether);
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(c), creator, 0.02 ether); // over the allowance
+        m.withdrawRoyaltyFund(address(c), creator, 0.01 ether);
+        m.withdrawRoyaltyFund(address(c), creator, 0.005 ether);
+        vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(c), creator, 1); // allowance used up
+        vm.stopPrank();
+        assertEq(creator.balance, 0.015 ether);
+        assertEq(m.creatorAllowance(address(c)), 0);
+        assertEq(m.royaltyFundOf(address(c)), 0.01 ether);
 
         vm.prank(alice); // strangers never
         vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
-        m.withdrawFloorFund(address(c), owner, 0);
+        m.withdrawRoyaltyFund(address(c), owner, 0);
     }
 
-    function test_floorFund_blockedSelfServe_stopsCreatorWithdrawals() public {
-        OwnedNFT c = new OwnedNFT(creator);
-        vm.prank(creator);
-        m.registerRoyaltyAsCreator(address(c), creator, 500);
-        vm.prank(owner);
+    function test_royaltyFund_openAllowance_isNotUsedUp() public {
+        OwnedNFT c = _soldOwnedCollection();
+        vm.prank(owner); // an active creator
+        m.setCreatorAllowance(address(c), type(uint256).max);
+        vm.startPrank(creator);
+        m.withdrawRoyaltyFund(address(c), creator, 0.01 ether);
+        m.withdrawRoyaltyFund(address(c), creator, 0.015 ether);
+        vm.stopPrank();
+        assertEq(m.creatorAllowance(address(c)), type(uint256).max);
+        assertEq(m.royaltyFundOf(address(c)), 0);
+
+        vm.prank(owner); // revoked
+        m.setCreatorAllowance(address(c), 0);
+        assertEq(m.creatorAllowance(address(c)), 0);
+    }
+
+    function test_royaltyFund_blockedSelfServe_stopsCreatorWithdrawals() public {
+        OwnedNFT c = _soldOwnedCollection();
+        vm.startPrank(owner);
+        m.setCreatorAllowance(address(c), type(uint256).max);
         m.setSelfServeBlocked(address(c), true);
+        vm.stopPrank();
         vm.prank(creator);
         vm.expectRevert(PentagonMarketplaceV3.NotAllowedToWithdraw.selector);
-        m.withdrawFloorFund(address(c), creator, 1);
+        m.withdrawRoyaltyFund(address(c), creator, 1);
+    }
+
+    function test_F14_creatorWashTrade_stillPaysTheFee() public {
+        OwnedNFT c = new OwnedNFT(creator);
+        address w = makeAddr("creatorWalletB");
+        vm.prank(owner);
+        m.setCollectionAllowed(address(c), true);
+        vm.prank(creator);
+        m.registerRoyaltyAsCreator(address(c), creator, 1000); // royalty back to themselves
+        c.mint(creator, 1);
+        vm.prank(creator);
+        c.setApprovalForAll(address(m), true);
+        vm.deal(w, 2 ether);
+        _list(creator, MockNFT(address(c)), 1, 1 ether);
+        _buy(w, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
+        // the group (creator + w) lost exactly the fee; the creator cannot get it back
+        assertEq(creator.balance + w.balance, 2 ether - 0.025 ether);
+        assertEq(m.floorFundOf(address(c)), 0.025 ether);
+        vm.prank(creator);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, creator));
+        m.withdrawFloorFund(address(c), creator, 0.025 ether);
     }
 
     function test_privateSale_onlyNamedBuyer_noFeeNoRoyalty() public {
@@ -448,7 +521,8 @@ contract MarketplaceV3Test is Test {
         vm.deal(carol, 5 ether);
         _buy(carol, a, 1, 1 ether, 1.025 ether);
         assertEq(a.ownerOf(1), carol);
-        assertEq(m.floorFundOf(address(a)), 0.05 ether);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether);
     }
 
     function test_tip_goesToTipJar_cappedAt5Percent() public {
@@ -504,7 +578,8 @@ contract MarketplaceV3Test is Test {
         vm.prank(creator);
         m.registerRoyaltyAsCreator(address(c), address(0), 0); // removed: back to the 2.5% default
         _buy(buyer, MockNFT(address(c)), 1, 1 ether, 1.025 ether);
-        assertEq(m.floorFundOf(address(c)), 0.05 ether); // not the frozen 10%
+        assertEq(m.royaltyFundOf(address(c)), 0.025 ether); // not the frozen 10%
+        assertEq(m.floorFundOf(address(c)), 0.025 ether);
         assertEq(alice.balance, 0.975 ether);
     }
 
@@ -570,14 +645,15 @@ contract MarketplaceV3Test is Test {
         m.acceptOffer(id, _ids(3), new bytes32[][](0));
         assertEq(a.ownerOf(3), buyer);
         assertEq(alice.balance, 0.975 ether);
-        assertEq(m.floorFundOf(address(a)), 0.05 ether);
-        assertEq(address(m).balance, 1.025 ether + 0.05 ether); // one fill left + the floor fund
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether);
+        assertEq(address(m).balance, 1.025 ether + 0.05 ether); // one fill left + the two funds
 
         uint256 before = buyer.balance;
         vm.prank(buyer);
         m.cancelOffer(id);
         assertEq(buyer.balance, before + 1.025 ether);
-        assertEq(address(m).balance, 0.05 ether); // only the floor fund is left
+        assertEq(address(m).balance, 0.05 ether); // only the two funds are left
     }
 
     function test_offer_cannotOverfill() public {
