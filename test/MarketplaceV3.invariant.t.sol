@@ -109,6 +109,8 @@ contract Handler is Test {
     mapping(address => uint256) public gAllowance; // model of creatorAllowance
     mapping(address => uint256) public gAllowanceSet; // value of the last setCreatorAllowance
     mapping(address => uint256) public gCreatorTaken; // creator withdrawals since that set
+    mapping(address => address) public gHolder; // model of creatorAllowanceHolder (owner() at grant time)
+    uint256 public badAllowanceSpends; // creator spends by anyone but the holder-while-owner() (must stay 0)
     address public gTipJar;
     mapping(address => mapping(uint256 => address)) internal gPriv; // model of privateBuyer
     bool public gPaused;
@@ -1118,10 +1120,12 @@ contract Handler is Test {
     function withdrawRoyaltyFund(uint256 callerSeed, uint256 cSeed, uint256 toSeed, uint256 amount) external {
         address c = address(nfts[cSeed % 3]);
         address cOwner = InvNFT(c).owner();
-        uint256 k = callerSeed % 4;
+        uint256 k = callerSeed % 5;
         address caller = k == 0
             ? owner
-            : (k != 3 && cOwner != address(0)) ? cOwner : tracked[(callerSeed / 4) % tracked.length];
+            : (k == 4 && gHolder[c] != address(0))
+                ? gHolder[c] // the wallet the allowance was granted to, possibly no longer owner()
+                : (k != 3 && cOwner != address(0)) ? cOwner : tracked[(callerSeed / 5) % tracked.length];
         uint256 j = toSeed % 4;
         address to = j == 0
             ? owner
@@ -1131,7 +1135,8 @@ contract Handler is Test {
         amount = bal == 0 ? bound(amount, 1, 1 ether) : bound(amount, 1, bal);
         if (toSeed % 7 == 0 && allow != type(uint256).max && allow < type(uint256).max - 1) amount = allow + 1; // over the allowance
         if (toSeed % 11 == 0) amount = bal + 1; // more than held
-        bool callerOk = caller == owner || (cOwner != address(0) && caller == cOwner && !gBlocked[c] && amount <= allow);
+        bool callerOk = caller == owner
+            || (cOwner != address(0) && caller == cOwner && caller == gHolder[c] && !gBlocked[c] && amount <= allow);
         bool toOk = to == owner || (cOwner != address(0) && to == cOwner);
         _begin();
         _exp(to, int256(amount));
@@ -1146,6 +1151,11 @@ contract Handler is Test {
             if (!toOk) _v("withdrawRoyaltyFund: paid a recipient other than our owner / the collection owner");
             if (amount > bal) _v("withdrawRoyaltyFund: withdrew more than the fund held");
             if (caller != owner) {
+                // F-15: only the wallet the allowance was granted to, while it is still owner(), may spend it
+                if (caller != gHolder[c] || caller != cOwner) {
+                    ++badAllowanceSpends;
+                    _v("withdrawRoyaltyFund: allowance spent by someone other than its holder-while-owner()");
+                }
                 gCreatorTaken[c] += amount;
                 if (allow != type(uint256).max) gAllowance[c] = allow - amount;
                 if (gAllowanceSet[c] != type(uint256).max && gCreatorTaken[c] > gAllowanceSet[c]) {
@@ -1160,13 +1170,24 @@ contract Handler is Test {
         address c = address(nfts[cSeed % 3]);
         uint256 k = amount % 4;
         amount = k == 0 ? 0 : k == 1 ? type(uint256).max : bound(amount, 1, 2 ether);
+        address holder = InvNFT(c).owner();
+        bool mustFail = amount != 0 && holder == address(0); // NotCollectionOwner
         _begin();
+        bool ok;
         vm.prank(owner);
-        m.setCreatorAllowance(c, amount);
-        gAllowance[c] = amount;
-        gAllowanceSet[c] = amount;
-        gCreatorTaken[c] = 0;
-        _end(true, "ownerSetCreatorAllowance");
+        try m.setCreatorAllowance(c, amount) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (mustFail) _v("setCreatorAllowance: granted an allowance to a collection with no owner()");
+            gAllowance[c] = amount;
+            gAllowanceSet[c] = amount;
+            gCreatorTaken[c] = 0;
+            gHolder[c] = holder;
+        } else if (!mustFail) {
+            _v("setCreatorAllowance: owner call reverted");
+        }
+        _end(ok, "ownerSetCreatorAllowance");
     }
 
     function ownerSetAllowed(uint256 cSeed, uint8 x) external {
@@ -1371,7 +1392,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         h = new Handler();
         m = h.m();
         targetContract(address(h));
-        bytes4[] memory s = new bytes4[](45);
+        bytes4[] memory s = new bytes4[](46);
         s[0] = Handler.list.selector;
         s[1] = Handler.delist.selector;
         s[2] = Handler.incrementNonce.selector;
@@ -1419,6 +1440,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         s[42] = Handler.withdrawRoyaltyFund.selector;
         s[43] = Handler.withdrawRoyaltyFund.selector;
         s[44] = Handler.ownerSetCreatorAllowance.selector;
+        s[45] = Handler.setCollectionOwner.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: s}));
     }
 
@@ -1457,9 +1479,11 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
     /// A creator never withdraws more of a royalty fund than the allowance our owner last set (unless open),
     /// and the on-chain allowance is always what is left of it.
     function invariant_creatorAllowanceNeverExceeded() public view {
+        assertEq(h.badAllowanceSpends(), 0, "allowance spent by someone other than its holder-while-owner()");
         for (uint256 c; c < 3; ++c) {
             address col = h.nft(c);
             assertEq(m.creatorAllowance(col), h.gAllowance(col), "creatorAllowance != model");
+            assertEq(m.creatorAllowanceHolder(col), h.gHolder(col), "creatorAllowanceHolder != model");
             uint256 set = h.gAllowanceSet(col);
             if (set != type(uint256).max) {
                 assertLe(h.gCreatorTaken(col), set, "creator took more than the allowance");
@@ -2025,19 +2049,69 @@ contract MarketplaceV3FuzzTest is Test {
         assertGt(groupBefore - groupAfter, (0.25 ether * 80) / 100, "more than the 80%-of-fee rebate it earns");
     }
 
-    /// F-15: creatorAllowance belongs to the collection, not to the wallet it was agreed with. If the collection
-    /// contract's owner() changes (ownership sold, transferred or compromised), the new owner() inherits whatever
-    /// is left of the allowance, an open one included.
-    function test_F15_allowanceFollowsTheCollectionOwner() public {
+    /// F-15 (fixed in 66ef13d): the allowance stays with the wallet it was granted to. If the collection's
+    /// owner() changes hands, the new owner() starts with nothing until our owner grants it one, and the old
+    /// holder can't use it either while it is no longer owner().
+    function test_F15_fixed_allowanceStaysWithTheWalletItWasGranted() public {
         a.setOwner(creator);
         _sellOne(a, 6);
         vm.prank(owner);
-        m.setCreatorAllowance(address(a), type(uint256).max); // agreed with `creator`
+        m.setCreatorAllowance(address(a), type(uint256).max); // granted to `creator`
+        assertEq(m.creatorAllowanceHolder(address(a)), creator);
         address newOwner = makeAddr("newCollectionOwner");
         a.setOwner(newOwner); // the collection contract changes hands
         vm.prank(newOwner);
+        vm.expectRevert(M.NotAllowedToWithdraw.selector);
         m.withdrawRoyaltyFund(address(a), newOwner, 0.025 ether);
-        assertEq(newOwner.balance, 0.025 ether);
+        vm.prank(creator); // the old holder is no longer owner()
+        vm.expectRevert(M.NotAllowedToWithdraw.selector);
+        m.withdrawRoyaltyFund(address(a), creator, 0.025 ether);
+        vm.prank(owner);
+        m.setCreatorAllowance(address(a), 0.01 ether); // a fresh grant, to the new owner()
+        vm.prank(newOwner);
+        m.withdrawRoyaltyFund(address(a), newOwner, 0.01 ether);
+        assertEq(newOwner.balance, 0.01 ether);
+        // no owner() at all: only a zero allowance can be set
+        a.setOwner(address(0));
+        vm.prank(owner);
+        vm.expectRevert(M.NotCollectionOwner.selector);
+        m.setCreatorAllowance(address(a), 1);
+    }
+
+    /// For any later owner(): only the wallet the allowance was granted to, while it is owner(), can spend it.
+    function testFuzz_allowanceOnlyForItsHolder(address later, bool backToHolder, uint256 amount) public {
+        vm.assume(later != address(0) && later != creator && later != owner && later.code.length == 0);
+        vm.assume(uint160(later) > 0x10000 && later != address(m));
+        a.setOwner(creator);
+        _sellOne(a, 6);
+        vm.prank(owner);
+        m.setCreatorAllowance(address(a), 0.02 ether);
+        a.setOwner(later);
+        if (backToHolder) a.setOwner(creator);
+        amount = bound(amount, 1, 0.02 ether);
+        vm.prank(later);
+        (bool okLater,) = address(m).call(abi.encodeCall(M.withdrawRoyaltyFund, (address(a), later, amount)));
+        vm.prank(creator);
+        (bool okHolder,) = address(m).call(abi.encodeCall(M.withdrawRoyaltyFund, (address(a), creator, amount)));
+        assertFalse(okLater, "a wallet the allowance was not granted to spent it");
+        assertEq(okHolder, backToHolder, "the holder can spend it only while it is owner()");
+    }
+
+    /// R2 (b7a1443): a listing of a collection that is no longer allowed is not live, so anyone can clear it,
+    /// and it does not come back at its old price when the collection is allowed again.
+    function test_disallowedCollectionListingIsStaleAndClearable() public {
+        vm.prank(seller);
+        m.list(address(a), _one(1), _one(1 ether), block.timestamp + 1 days);
+        assertTrue(m.isListingLive(address(a), 1));
+        vm.prank(owner);
+        m.setCollectionAllowed(address(a), false);
+        assertFalse(m.isListingLive(address(a), 1), "not live while the collection is disallowed");
+        m.clearStale(address(a), _one(1));
+        (address s_,,,,,) = m.listings(address(a), 1);
+        assertEq(s_, address(0), "cleared");
+        vm.prank(owner);
+        m.setCollectionAllowed(address(a), true);
+        assertFalse(m.isListingLive(address(a), 1), "does not come back");
     }
 
     /// F-5 (fixed): renounceOwnership is disabled, so the marketplace can never become ownerless.
@@ -2089,9 +2163,11 @@ contract MarketplaceV3PropertyHarness is Handler {
     }
 
     function _allowanceOk() internal view returns (bool) {
+        if (badAllowanceSpends != 0) return false;
         for (uint256 c; c < 3; ++c) {
             address col = address(nfts[c]);
             if (m.creatorAllowance(col) != gAllowance[col]) return false;
+            if (m.creatorAllowanceHolder(col) != gHolder[col]) return false;
             if (gAllowanceSet[col] != type(uint256).max && gCreatorTaken[col] > gAllowanceSet[col]) return false;
         }
         return true;
