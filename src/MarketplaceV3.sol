@@ -55,8 +55,16 @@ interface IOwnableCollection {
 ///   clean floor F. The co-signer enforces the order's audience (collectors only, holders of X, named
 ///   wallets) and refuses fat-finger and phishing patterns. It can't change what the seller signed: the
 ///   contract never sells outside [priceMin, priceMax] or to a buyer above their maxPrice.
-///   Signed orders pay today's fee and royalty, and are refused while either is above the rate the
-///   seller signed (a raise pauses them until re-signed; it can't be charged to them).
+///   Signed orders pay today's fee and royalty (within the hard caps). A seller who signed
+///   acceptFeeChanges = false is protected instead: the order is refused while either rate is above
+///   what they signed. Named-wallet orders (a Merkle root checked here) are free, like listPrivate.
+/// - Floor reference (nftprof 2026-11-07): per collection, the co-signer's F is clamped to a band
+///   around an on-chain reference that widens with time (−fall / +rise per day); the reference then
+///   moves to the clamped F. Signed fills priced below floorBackstopBps of the band's low end are refused.
+/// - Flags (nftprof 2026-11-07): the flagger reports tokens (e.g. stolen). A flagged token sells only as a
+///   signed order whose buyer accepted the warning; it is then held (no resale here) unless the
+///   co-signer marked the buyer high-reputation or the flagger clears it. The claimant (original owner)
+///   may buy it back at no more than max(price paid, floor reference). Flags bind this marketplace only.
 /// - Owner powers: fee, royalties, tip jar, floor- and royalty-fund withdrawals and creator allowances (above), which collections trade, pause / unpause,
 ///   naming a guardian (a hot key that can only pause) and the co-signer, and, while paused, refunding
 ///   offers to their bidders. The owner can never move anyone's NFT or money elsewhere.
@@ -66,18 +74,27 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     uint256 public constant MAX_DURATION = 180 days;
     uint256 public constant PAYOUT_GAS = 50_000;
     /// A co-signer's FillAuth (and the floor in it) is good for at most this long.
-    uint256 public constant MAX_AUTH_WINDOW = 5 minutes;
+    uint256 private constant MAX_AUTH_WINDOW = 5 minutes;
     uint256 private constant ONE = 1e18;
     uint256 private constant BPS = 10_000;
 
-    bytes32 public constant ORDER_TYPEHASH = keccak256(
-        "Order(address seller,address collection,uint256 tokenId,uint96 startPrice,uint96 endPrice,uint40 rampStart,uint40 rampEnd,uint128 floorRef,uint16 upBps,uint16 downBps,uint96 priceMin,uint96 priceMax,bytes32 audience,uint16 feeBps,uint16 royaltyBps,uint64 nonce,uint40 start,uint40 expiry,uint256 salt)"
+    bytes32 private constant ORDER_TYPEHASH = keccak256(
+        "Order(address seller,address collection,uint256 tokenId,uint96 startPrice,uint96 endPrice,uint40 rampStart,uint40 rampEnd,uint128 floorRef,uint16 upBps,uint16 downBps,uint96 priceMin,uint96 priceMax,bytes32 audience,uint8 audienceKind,uint16 feeBps,uint16 royaltyBps,bool acceptFeeChanges,uint64 nonce,uint40 start,uint40 expiry,uint256 salt)"
     );
-    bytes32 public constant FILL_AUTH_TYPEHASH =
-        keccak256("FillAuth(bytes32 orderHash,address buyer,uint128 floor,uint40 deadline)");
+    bytes32 private constant FILL_AUTH_TYPEHASH = keccak256(
+        "FillAuth(bytes32 orderHash,address buyer,uint128 floor,uint40 deadline,bool flagAck,bool clearFlag)"
+    );
 
     uint8 private constant ORDER_FILLED = 1;
     uint8 private constant ORDER_CANCELLED = 2;
+    /// audienceKind: 0 = everyone; NAMED = `audience` is a Merkle root of the wallets that may buy,
+    /// checked here, and the sale is free like listPrivate; any other kind is enforced by the co-signer.
+    uint8 private constant AUDIENCE_NAMED = 1;
+    uint8 private constant FLAG_FLAGGED = 1;
+    uint8 private constant FLAG_HELD = 2;
+    uint256 private constant SALE_SIGNED = 1;
+    uint256 private constant SALE_ACK = 2;
+    uint256 private constant SALE_CLEAR = 4;
 
     struct Listing {
         address seller;
@@ -126,9 +143,11 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         uint16 downBps; // and down (0..10000)
         uint96 priceMin; // never sold below this
         uint96 priceMax; // or above this, whatever the floor does
-        bytes32 audience; // who may buy, enforced by the co-signer; 0 = everyone
-        uint16 feeBps; // the most fee / royalty this order accepts (the rates shown when signed)
+        bytes32 audience; // who may buy (see audienceKind)
+        uint8 audienceKind; // 0 = everyone, AUDIENCE_NAMED = Merkle root of wallets, other = co-signer
+        uint16 feeBps; // the fee / royalty rates shown when signed
         uint16 royaltyBps;
+        bool acceptFeeChanges; // true: pay today's rates even if raised (up to the caps); false: refused while above
         uint64 nonce; // must equal sellerNonce[seller]; incrementNonce cancels it
         uint40 start;
         uint40 expiry; // at most MAX_DURATION after start
@@ -142,6 +161,22 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         uint40 authDeadline;
         bytes cosignerSig;
         uint256 maxPrice; // the price the buyer saw
+        bytes32[] proof; // AUDIENCE_NAMED: the buyer is in the order's Merkle root
+        bool flagAck; // co-signer: the buyer accepted the flagged-token warning
+        bool clearFlag; // co-signer: a high-reputation buyer; the purchase clears the flag
+    }
+
+    /// Per collection: the on-chain floor reference that bounds the co-signer's F (see _floor).
+    struct FloorRef {
+        uint128 ref;
+        uint40 updatedAt;
+    }
+
+    /// A token reported (e.g. stolen) by the flagger. Binds this marketplace only.
+    struct Flag {
+        uint8 state; // FLAG_FLAGGED: sellable only signed + acknowledged; FLAG_HELD: bought while flagged, no resale
+        uint96 paid; // what the holder paid for it while flagged
+        address claimant; // the original owner, who may buy it back at max(paid, floor ref)
     }
 
     mapping(address => bool) public collectionAllowed;
@@ -163,11 +198,18 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     /// The owner() wallet the allowance was granted to; only it may use the allowance.
     mapping(address => address) public creatorAllowanceHolder;
 
-    /// EIP-712 order hash => ORDER_FILLED / ORDER_CANCELLED (0 = open)
-    mapping(bytes32 => uint8) public orderStatus;
+    /// seller => EIP-712 order hash => ORDER_FILLED / ORDER_CANCELLED (0 = open). Keyed by seller so a
+    /// cancel by hash can only ever touch the caller's own orders (the hash commits to the seller).
+    mapping(address => mapping(bytes32 => uint8)) public orderStatus;
+    mapping(address => FloorRef) public floorRefs;
+    mapping(address => mapping(uint256 => Flag)) public flags;
 
     address public guardian; // may pause (never unpause); 0 = owner only
     address public cosigner; // signs FillAuths for signed orders; 0 = signed orders can't be filled
+    address public flagger; // flags, clears and names claimants
+    uint16 public floorFallBpsPerDay; // how fast F may fall below the reference, per day since it last moved
+    uint32 public floorRiseBpsPerDay; // and rise above it
+    uint16 public floorBackstopBps; // signed fills priced below this share of the floor band's low end are refused
     address public tipJar; // where buyer tips go (NFTC liquidity)
     uint16 public feeBps;
     uint16 public defaultRoyaltyBps;
@@ -197,6 +239,10 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     event OrderFilled(bytes32 indexed orderHash, address indexed seller, address indexed buyer, uint256 price);
     event OrderCancelled(bytes32 indexed orderHash, address indexed seller);
     event CosignerSet(address cosigner);
+    event FlaggerSet(address flagger);
+    event FloorParamsSet(uint256 fallBpsPerDay, uint256 riseBpsPerDay, uint256 backstopBps);
+    event FloorRefUpdated(address indexed collection, uint256 ref);
+    event FlagSet(address indexed collection, uint256 indexed tokenId, uint256 state, address claimant, uint256 paid);
 
     error CollectionNotAllowed();
     error LengthMismatch();
@@ -235,6 +281,12 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     error AuthExpired();
     error CosignerNotSet();
     error RateAboveSigned();
+    error BelowFloorBackstop();
+    error NotFlagger();
+    error TokenFlagged();
+    error TokenHeld();
+    error AboveClaimantPrice();
+    error RefAlreadySet();
 
     constructor(address owner_, address tipJar_, uint16 feeBps_, uint16 defaultRoyaltyBps_)
         Ownable(owner_)
@@ -245,6 +297,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         emit TipJarSet(tipJar_);
         _setFee(feeBps_);
         _setDefaultRoyalty(defaultRoyaltyBps_);
+        _setFloorParams(2000, 5000, 1000); // −20% / +50% per day, refuse below 10% of the band's low end
     }
 
     // ───────────────────────────── Listings ─────────────────────────────
@@ -335,7 +388,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
             uint256 fee = (uint256(l.price) * l.feeBps) / 10_000;
             spent += uint256(l.price) + fee;
             if (spent > msg.value) revert InsufficientPayment();
-            _beforeSale(it.collection, it.tokenId, l.seller, msg.sender);
+            _beforeSale(it.collection, it.tokenId, msg.sender, l.price, 0);
             // Reverts if the seller no longer owns the NFT or revoked approval.
             IERC721(it.collection).transferFrom(l.seller, msg.sender, it.tokenId);
             _settle(it.collection, it.tokenId, l.seller, msg.sender, l.price, fee, l.royaltyBps, 0);
@@ -347,41 +400,63 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
 
     /// Buy one or more signed listings. Send at least sum(price + fee); the rest is refunded. `tip` as in buy().
     function buySigned(SignedBuy[] calldata items, uint256 tip) external payable nonReentrant whenNotPaused {
-        address cs = cosigner;
-        if (cs == address(0)) revert CosignerNotSet();
+        if (cosigner == address(0)) revert CosignerNotSet();
         uint256 spent;
         for (uint256 i; i < items.length; ++i) {
-            SignedBuy calldata it = items[i];
-            Order calldata o = it.order;
-            bytes32 h = _checkOrder(o, it.sellerSig);
-            if (it.authDeadline < block.timestamp || it.authDeadline > block.timestamp + MAX_AUTH_WINDOW) revert AuthExpired();
-            if (!SignatureChecker.isValidSignatureNow(cs, fillAuthDigest(h, msg.sender, it.floor, it.authDeadline), it.cosignerSig)) {
-                revert BadCosignerSig();
-            }
-            uint256 price = priceAt(o, it.floor, block.timestamp);
-            if (price > it.maxPrice) revert PriceAboveMax();
-            orderStatus[h] = ORDER_FILLED;
-            if (listings[o.collection][o.tokenId].seller != address(0)) _removeListing(o.collection, o.tokenId);
-            // Today's fee; _checkOrder refused the order if it is above what the seller signed.
-            uint256 fee = (price * feeBps) / BPS;
-            spent += price + fee;
+            spent += _fillSigned(items[i]);
             if (spent > msg.value) revert InsufficientPayment();
-            _beforeSale(o.collection, o.tokenId, o.seller, msg.sender);
-            // Reverts if the seller no longer owns the NFT or revoked approval.
-            IERC721(o.collection).transferFrom(o.seller, msg.sender, o.tokenId);
-            _settle(o.collection, o.tokenId, o.seller, msg.sender, price, fee, o.royaltyBps, 0);
-            emit OrderFilled(h, o.seller, msg.sender, price);
         }
         _finishPurchase(spent, tip);
     }
 
-    /// Cancel signed orders you made (works when paused). To cancel all of them at once, incrementNonce().
-    function cancelOrders(Order[] calldata orders) external {
-        for (uint256 i; i < orders.length; ++i) {
-            if (orders[i].seller != msg.sender) revert NotSeller();
-            bytes32 h = hashOrder(orders[i]);
-            if (orderStatus[h] == ORDER_FILLED) revert OrderNotLive();
-            orderStatus[h] = ORDER_CANCELLED;
+    /// One signed fill; returns what the buyer owes for it (price + fee).
+    function _fillSigned(SignedBuy calldata it) internal returns (uint256) {
+        Order calldata o = it.order;
+        bytes32 h = _checkOrder(o, it.sellerSig);
+        bool named = o.audienceKind == AUDIENCE_NAMED;
+        if (named && !MerkleProof.verifyCalldata(it.proof, o.audience, keccak256(bytes.concat(keccak256(abi.encode(msg.sender)))))) {
+            revert NotPrivateBuyer();
+        }
+        if (it.authDeadline < block.timestamp || it.authDeadline > block.timestamp + MAX_AUTH_WINDOW) revert AuthExpired();
+        if (
+            !SignatureChecker.isValidSignatureNow(
+                cosigner, fillAuthDigest(h, msg.sender, it.floor, it.authDeadline, it.flagAck, it.clearFlag), it.cosignerSig
+            )
+        ) revert BadCosignerSig();
+
+        (uint256 f, uint256 low) = _floor(o.collection, it.floor);
+        uint256 price = priceAt(o, f, block.timestamp);
+        if (price > it.maxPrice) revert PriceAboveMax();
+        if (price < (low * floorBackstopBps) / BPS) revert BelowFloorBackstop();
+        orderStatus[o.seller][h] = ORDER_FILLED;
+        if (listings[o.collection][o.tokenId].seller != address(0)) _removeListing(o.collection, o.tokenId);
+
+        // Named-wallet orders are free, like listPrivate. Others pay today's fee and royalty (_checkOrder
+        // refused the order if a raise is above what a seller who didn't accept fee changes signed).
+        uint256 fee;
+        uint256 royaltyCap;
+        if (!named) {
+            fee = (price * feeBps) / BPS;
+            royaltyCap = MAX_ROYALTY_BPS;
+        }
+        _beforeSale(
+            o.collection, o.tokenId, msg.sender, price,
+            SALE_SIGNED | (it.flagAck ? SALE_ACK : 0) | (it.clearFlag ? SALE_CLEAR : 0)
+        );
+        // Reverts if the seller no longer owns the NFT or revoked approval.
+        IERC721(o.collection).transferFrom(o.seller, msg.sender, o.tokenId);
+        _settle(o.collection, o.tokenId, o.seller, msg.sender, price, fee, royaltyCap, 0);
+        emit OrderFilled(h, o.seller, msg.sender, price);
+        return price + fee;
+    }
+
+    /// Cancel signed orders you made, by their hashes (works when paused). A hash that isn't one of your
+    /// orders cancels nothing. To cancel all of them at once, incrementNonce().
+    function cancelOrders(bytes32[] calldata orderHashes) external {
+        for (uint256 i; i < orderHashes.length; ++i) {
+            bytes32 h = orderHashes[i];
+            if (orderStatus[msg.sender][h] == ORDER_FILLED) revert OrderNotLive();
+            orderStatus[msg.sender][h] = ORDER_CANCELLED;
             emit OrderCancelled(h, msg.sender);
         }
     }
@@ -392,8 +467,37 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     }
 
     /// The EIP-712 digest the co-signer signs to let `buyer` fill `orderHash` at clean floor `floor`.
-    function fillAuthDigest(bytes32 orderHash, address buyer, uint128 floor, uint40 deadline) public view returns (bytes32) {
-        return _hashTypedDataV4(keccak256(abi.encode(FILL_AUTH_TYPEHASH, orderHash, buyer, floor, deadline)));
+    function fillAuthDigest(bytes32 orderHash, address buyer, uint128 floor, uint40 deadline, bool flagAck, bool clearFlag)
+        public
+        view
+        returns (bytes32)
+    {
+        return _hashTypedDataV4(
+            keccak256(abi.encode(FILL_AUTH_TYPEHASH, orderHash, buyer, floor, deadline, flagAck, clearFlag))
+        );
+    }
+
+    /// The co-signer's floor `f` clamped to the collection's band right now, and the band's low end.
+    /// The band is the reference ± a per-day rate × the time since the reference last moved, so a
+    /// one-shot crash is softened while a real, sustained move gets through within days, and the band
+    /// keeps widening while nothing fills (it can't get stuck). ref = 0 (never seeded): f is taken as is.
+    function floorBand(address collection, uint256 f) public view returns (uint256 clamped, uint256 low) {
+        FloorRef memory r = floorRefs[collection];
+        if (r.ref == 0) return (f, f);
+        uint256 dt = block.timestamp - r.updatedAt;
+        uint256 fall = (dt * floorFallBpsPerDay) / 1 days;
+        low = fall >= BPS ? 0 : (uint256(r.ref) * (BPS - fall)) / BPS;
+        uint256 high = Math.mulDiv(r.ref, BPS + (dt * floorRiseBpsPerDay) / 1 days, BPS);
+        clamped = f < low ? low : f > high ? high : f;
+    }
+
+    /// Clamp f to the band and move the reference to it.
+    function _floor(address collection, uint256 f) internal returns (uint256 clamped, uint256 low) {
+        (clamped, low) = floorBand(collection, f);
+        if (clamped == 0) return (0, 0); // never seeded and no floor given: nothing to anchor
+        uint256 ref = clamped > type(uint128).max ? type(uint128).max : clamped;
+        floorRefs[collection] = FloorRef(uint128(ref), uint40(block.timestamp));
+        emit FloorRefUpdated(collection, ref);
     }
 
     /// The price of `o` at time `t` with clean floor `floor`:
@@ -430,14 +534,17 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
     /// Everything about an order except the co-signer and the buyer's price limit. Returns its hash.
     function _checkOrder(Order calldata o, bytes calldata sig) internal view returns (bytes32 h) {
         h = hashOrder(o);
-        if (orderStatus[h] != 0) revert OrderNotLive();
+        if (orderStatus[o.seller][h] != 0) revert OrderNotLive();
         if (o.seller == msg.sender) revert SelfTrade();
         if (!collectionAllowed[o.collection]) revert CollectionNotAllowed();
         if (
             o.nonce != sellerNonce[o.seller] || block.timestamp < o.start || block.timestamp > o.expiry
                 || o.expiry - o.start > MAX_DURATION
         ) revert OrderNotLive();
-        if (feeBps > o.feeBps || _royaltyBps(o.collection) > o.royaltyBps) revert RateAboveSigned();
+        if (
+            o.audienceKind != AUDIENCE_NAMED && !o.acceptFeeChanges
+                && (feeBps > o.feeBps || _royaltyBps(o.collection) > o.royaltyBps)
+        ) revert RateAboveSigned();
         // SignatureChecker: ECDSA via tryRecover (no address(0) match) or ERC-1271 for contract wallets.
         if (!SignatureChecker.isValidSignatureNow(o.seller, h, sig)) revert BadSellerSig();
     }
@@ -503,7 +610,7 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
             uint256 id = tokenIds[i];
             if (root != bytes32(0) && !MerkleProof.verifyCalldata(proofs[i], root, _leaf(id))) revert TokenNotInOffer();
             if (listings[collection][id].seller != address(0)) _removeListing(collection, id);
-            _beforeSale(collection, id, msg.sender, bidder);
+            _beforeSale(collection, id, bidder, price, 0);
             // Reverts unless the caller owns this token of the offer's collection and approved us.
             IERC721(collection).transferFrom(msg.sender, bidder, id);
             _settle(collection, id, msg.sender, bidder, price, fee, royaltyBps, offerId);
@@ -665,6 +772,39 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         emit CosignerSet(cosigner_);
     }
 
+    function setFlagger(address flagger_) external onlyOwner {
+        flagger = flagger_;
+        emit FlaggerSet(flagger_);
+    }
+
+    /// Bounds keep the band honest: it always opens fully within 20 days of no fills (fall ≥ 5%/day),
+    /// and the backstop never refuses more than half the band's low end.
+    function setFloorParams(uint16 fallBpsPerDay, uint32 riseBpsPerDay, uint16 backstopBps) external onlyOwner {
+        _setFloorParams(fallBpsPerDay, riseBpsPerDay, backstopBps);
+    }
+
+    /// One-time seed of a collection's floor reference (otherwise the first signed fill seeds it).
+    function seedFloorRef(address collection, uint128 ref) external onlyOwner {
+        if (floorRefs[collection].ref != 0) revert RefAlreadySet();
+        if (ref == 0) revert BadPrice();
+        floorRefs[collection] = FloorRef(ref, uint40(block.timestamp));
+        emit FloorRefUpdated(collection, ref);
+    }
+
+    /// Flag a token (or update its claimant), or clear it (flagged = false). A token already held keeps
+    /// its hold; only clearing lifts it.
+    function setFlag(address collection, uint256 tokenId, bool flagged, address claimant) external {
+        if (msg.sender != flagger) revert NotFlagger();
+        Flag storage fl = flags[collection][tokenId];
+        if (!flagged) {
+            delete flags[collection][tokenId];
+        } else {
+            if (fl.state == 0) fl.state = FLAG_FLAGGED;
+            fl.claimant = claimant;
+        }
+        emit FlagSet(collection, tokenId, fl.state, fl.claimant, fl.paid);
+    }
+
     function unpause() external onlyOwner {
         _unpause();
     }
@@ -685,9 +825,30 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         return nft.isApprovedForAll(l.seller, address(this)) || nft.getApproved(tokenId) == address(this);
     }
 
-    /// Called before every sale (listing, signed order, offer), before the NFT moves. Empty for now:
-    /// the hook for a per-NFT hold (e.g. a flagged token), which nftprof hasn't decided yet.
-    function _beforeSale(address collection, uint256 tokenId, address seller, address buyer) internal virtual {}
+    /// Called before every sale (listing, signed order, offer), before the NFT moves. Enforces flags
+    /// (nftprof 2026-11-07): a flagged token sells only as a signed order whose buyer acknowledged the
+    /// warning; that purchase holds it (no resale) unless the co-signer marked the buyer high-reputation.
+    /// The claimant may always buy it back at no more than max(paid, floor ref), which clears it.
+    function _beforeSale(address collection, uint256 tokenId, address buyer, uint256 price, uint256 how) internal {
+        Flag storage fl = flags[collection][tokenId];
+        uint8 state = fl.state;
+        if (state == 0) return;
+        if (buyer == fl.claimant) {
+            uint256 ref = floorRefs[collection].ref;
+            if (price > (fl.paid > ref ? fl.paid : ref)) revert AboveClaimantPrice();
+            delete flags[collection][tokenId];
+        } else if (state == FLAG_HELD) {
+            revert TokenHeld();
+        } else if (how & (SALE_SIGNED | SALE_ACK) != (SALE_SIGNED | SALE_ACK)) {
+            revert TokenFlagged();
+        } else if (how & SALE_CLEAR != 0) {
+            delete flags[collection][tokenId];
+        } else {
+            fl.state = FLAG_HELD;
+            fl.paid = uint96(price);
+        }
+        emit FlagSet(collection, tokenId, fl.state, fl.claimant, fl.paid);
+    }
 
     function _removeListing(address collection, uint256 tokenId) internal {
         address seller = listings[collection][tokenId].seller;
@@ -772,6 +933,16 @@ contract PentagonMarketplaceV3 is Ownable2Step, ReentrancyGuard, Pausable, EIP71
         if (bps > MAX_FEE_BPS) revert BpsTooHigh();
         feeBps = bps;
         emit FeeSet(bps);
+    }
+
+    function _setFloorParams(uint16 fallBpsPerDay, uint32 riseBpsPerDay, uint16 backstopBps) internal {
+        if (fallBpsPerDay < 500 || fallBpsPerDay > 5000 || riseBpsPerDay < 500 || riseBpsPerDay > 100_000 || backstopBps > 5000) {
+            revert BpsTooHigh();
+        }
+        floorFallBpsPerDay = fallBpsPerDay;
+        floorRiseBpsPerDay = riseBpsPerDay;
+        floorBackstopBps = backstopBps;
+        emit FloorParamsSet(fallBpsPerDay, riseBpsPerDay, backstopBps);
     }
 
     function _setDefaultRoyalty(uint16 bps) internal {

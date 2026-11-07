@@ -104,10 +104,23 @@ contract MarketplaceV3SignedTest is Test {
         view
         returns (PentagonMarketplaceV3.SignedBuy memory it)
     {
+        it = _itemX(o, sellerKey, who, floor, maxPrice, false, false, new bytes32[](0));
+    }
+
+    function _itemX(
+        PentagonMarketplaceV3.Order memory o,
+        uint256 sellerKey,
+        address who,
+        uint128 floor,
+        uint256 maxPrice,
+        bool ack,
+        bool clear,
+        bytes32[] memory proof
+    ) internal view returns (PentagonMarketplaceV3.SignedBuy memory it) {
         bytes32 h = m.hashOrder(o);
-        uint40 dl = uint40(block.timestamp + 5 minutes);
+        uint40 dl = uint40(vm.getBlockTimestamp() + 5 minutes);
         it = PentagonMarketplaceV3.SignedBuy(
-            o, _sig(sellerKey, h), floor, dl, _sig(csKey, m.fillAuthDigest(h, who, floor, dl)), maxPrice
+            o, _sig(sellerKey, h), floor, dl, _sig(csKey, m.fillAuthDigest(h, who, floor, dl, ack, clear)), maxPrice, proof, ack, clear
         );
     }
 
@@ -136,7 +149,7 @@ contract MarketplaceV3SignedTest is Test {
         assertEq(m.royaltyFundOf(address(a)), 0.025 ether);
         assertEq(buyer.balance, 100 ether - 1.025 ether);
         assertEq(treasury.balance, 0);
-        assertEq(m.orderStatus(m.hashOrder(o)), 1);
+        assertEq(m.orderStatus(alice, m.hashOrder(o)), 1);
         assertEq(address(m).balance, 0.05 ether); // exactly the two funds
     }
 
@@ -248,7 +261,7 @@ contract MarketplaceV3SignedTest is Test {
         it.cosignerSig = "";
         vm.expectRevert(PentagonMarketplaceV3.BadCosignerSig.selector);
         _fill(it, buyer, 2 ether);
-        it.cosignerSig = _sig(malloryKey, m.fillAuthDigest(m.hashOrder(it.order), buyer, 0, it.authDeadline));
+        it.cosignerSig = _sig(malloryKey, m.fillAuthDigest(m.hashOrder(it.order), buyer, 0, it.authDeadline, false, false));
         vm.expectRevert(PentagonMarketplaceV3.BadCosignerSig.selector);
         _fill(it, buyer, 2 ether);
         it.cosignerSig = good;
@@ -282,7 +295,7 @@ contract MarketplaceV3SignedTest is Test {
         bytes32 h = m.hashOrder(it.order);
         uint40 dl = uint40(vm.getBlockTimestamp() + 5 minutes + 1); // via-ir caches block.timestamp across warp
         it.authDeadline = dl;
-        it.cosignerSig = _sig(csKey, m.fillAuthDigest(h, buyer, 0, dl));
+        it.cosignerSig = _sig(csKey, m.fillAuthDigest(h, buyer, 0, dl, false, false));
         vm.expectRevert(PentagonMarketplaceV3.AuthExpired.selector);
         _fill(it, buyer, 2 ether);
     }
@@ -352,14 +365,15 @@ contract MarketplaceV3SignedTest is Test {
 
     function test_cancelOrders() public {
         PentagonMarketplaceV3.Order memory o = _fixed(alice, 1, 1 ether);
-        PentagonMarketplaceV3.Order[] memory os = new PentagonMarketplaceV3.Order[](1);
-        os[0] = o;
+        bytes32[] memory hs = new bytes32[](1);
+        hs[0] = m.hashOrder(o);
+        // Someone else "cancelling" alice's hash only writes into their own namespace: alice's order lives.
         vm.prank(other);
-        vm.expectRevert(PentagonMarketplaceV3.NotSeller.selector);
-        m.cancelOrders(os);
+        m.cancelOrders(hs);
+        assertEq(m.orderStatus(alice, hs[0]), 0);
         vm.prank(alice);
-        m.cancelOrders(os);
-        assertEq(m.orderStatus(m.hashOrder(o)), 2);
+        m.cancelOrders(hs);
+        assertEq(m.orderStatus(alice, hs[0]), 2);
         PentagonMarketplaceV3.SignedBuy memory pre4 = _item(o, aliceKey, buyer, 0, 1 ether);
         vm.expectRevert(PentagonMarketplaceV3.OrderNotLive.selector);
         _fill(pre4, buyer, 2 ether);
@@ -368,11 +382,11 @@ contract MarketplaceV3SignedTest is Test {
     function test_cancelFilledOrder_reverts() public {
         PentagonMarketplaceV3.Order memory o = _fixed(alice, 1, 1 ether);
         _fill(_item(o, aliceKey, buyer, 0, 1 ether), buyer, 1.025 ether);
-        PentagonMarketplaceV3.Order[] memory os = new PentagonMarketplaceV3.Order[](1);
-        os[0] = o;
+        bytes32[] memory hs = new bytes32[](1);
+        hs[0] = m.hashOrder(o);
         vm.prank(alice);
         vm.expectRevert(PentagonMarketplaceV3.OrderNotLive.selector);
-        m.cancelOrders(os);
+        m.cancelOrders(hs);
     }
 
     function test_incrementNonce_cancelsAllSigned() public {
@@ -442,13 +456,13 @@ contract MarketplaceV3SignedTest is Test {
     }
 
     function test_cancelWorksWhilePaused() public {
-        PentagonMarketplaceV3.Order[] memory os = new PentagonMarketplaceV3.Order[](1);
-        os[0] = _fixed(alice, 1, 1 ether);
+        bytes32[] memory hs = new bytes32[](1);
+        hs[0] = m.hashOrder(_fixed(alice, 1, 1 ether));
         vm.prank(owner);
         m.pause();
         vm.prank(alice);
-        m.cancelOrders(os);
-        assertEq(m.orderStatus(m.hashOrder(os[0])), 2);
+        m.cancelOrders(hs);
+        assertEq(m.orderStatus(alice, hs[0]), 2);
     }
 
     // ───────── ERC-1271 seller ─────────
@@ -488,7 +502,7 @@ contract MarketplaceV3SignedTest is Test {
         assertEq(a.ownerOf(7), buyer);
         assertFalse(rs.reentered());
         assertEq(m.pendingPayouts(address(rs)), 0.975 ether);
-        assertEq(m.orderStatus(m.hashOrder(o2)), 0);
+        assertEq(m.orderStatus(alice, m.hashOrder(o2)), 0);
         assertEq(a.ownerOf(2), alice);
         // The same call made directly, not re-entering, works: the order itself was fine.
         bytes memory p = rs.payload();
@@ -659,5 +673,392 @@ contract MarketplaceV3SignedTest is Test {
         uint256 p = _price(o, f, block.timestamp + dt);
         assertGe(p, lo);
         assertLe(p, hi);
+    }
+
+    // ───────── fee changes accepted (nftprof 2026-11-07) ─────────
+
+    function test_acceptFeeChanges_feeRaise_paysNewFee() public {
+        PentagonMarketplaceV3.Order memory o = _fixed(alice, 1, 1 ether);
+        o.acceptFeeChanges = true;
+        PentagonMarketplaceV3.SignedBuy memory it = _item(o, aliceKey, buyer, 0, 1 ether);
+        vm.prank(owner);
+        m.setFee(500); // the hard cap
+        _fill(it, buyer, 1.05 ether);
+        assertEq(m.floorFundOf(address(a)), 0.05 ether);
+        assertEq(alice.balance, 0.975 ether);
+    }
+
+    function test_acceptFeeChanges_royaltyRaise_paysNewRoyaltyUpToCap() public {
+        PentagonMarketplaceV3.Order memory o = _fixed(alice, 1, 1 ether);
+        o.acceptFeeChanges = true;
+        PentagonMarketplaceV3.SignedBuy memory it = _item(o, aliceKey, buyer, 0, 1 ether);
+        vm.prank(owner);
+        m.registerRoyalty(address(a), creator, 1000); // the 10% cap
+        _fill(it, buyer, 1.025 ether);
+        assertEq(creator.balance, 0.1 ether);
+        assertEq(alice.balance, 0.9 ether);
+    }
+
+    function test_acceptFeeChanges_signedZero_stillPaysTodaysRates() public {
+        PentagonMarketplaceV3.Order memory o = _fixed(alice, 1, 1 ether);
+        o.acceptFeeChanges = true;
+        o.feeBps = 0;
+        o.royaltyBps = 0;
+        _fill(_item(o, aliceKey, buyer, 0, 1 ether), buyer, 1.025 ether);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
+        assertEq(m.royaltyFundOf(address(a)), 0.025 ether);
+    }
+
+    // ───────── on-chain floor reference (nftprof 2026-11-07) ─────────
+
+    function _followFloor(address seller, uint256 id) internal view returns (PentagonMarketplaceV3.Order memory o) {
+        o = _fixed(seller, id, 1 ether);
+        o.floorRef = 1 ether;
+        o.upBps = 10_000;
+        o.downBps = 10_000;
+        o.priceMin = 0.01 ether;
+        o.priceMax = 10 ether;
+    }
+
+    function _seed(uint128 ref) internal {
+        vm.prank(owner);
+        m.seedFloorRef(address(a), ref);
+    }
+
+    function _ref() internal view returns (uint256 r) {
+        (r,) = m.floorRefs(address(a));
+    }
+
+    function test_floor_seedOnceOwnerOnly() public {
+        vm.prank(other);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, other));
+        m.seedFloorRef(address(a), 1 ether);
+        _seed(1 ether);
+        vm.prank(owner);
+        vm.expectRevert(PentagonMarketplaceV3.RefAlreadySet.selector);
+        m.seedFloorRef(address(a), 2 ether);
+    }
+
+    function test_floor_firstFillSeeds() public {
+        assertEq(_ref(), 0);
+        _fill(_item(_fixed(alice, 1, 1 ether), aliceKey, buyer, 0.8 ether, 1 ether), buyer, 1.025 ether);
+        assertEq(_ref(), 0.8 ether);
+    }
+
+    function test_floor_oneShotCrashSoftened() public {
+        _seed(1 ether);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        // A misbehaving co-signer reports a 90% crash an hour after the last fill.
+        PentagonMarketplaceV3.SignedBuy memory it = _item(_followFloor(alice, 1), aliceKey, buyer, 0.1 ether, 10 ether);
+        _fill(it, buyer, 2 ether);
+        // −20%/day × 1 hour = 83 bps (rounded down): F is clamped to 0.9917, and so is the price.
+        assertEq(_ref(), 0.9917 ether);
+        assertEq(alice.balance, (0.9917 ether * 9750) / 10_000);
+    }
+
+    function test_floor_sustainedDropGetsThroughInDays_dailyFills() public {
+        _seed(1 ether);
+        uint256 t = vm.getBlockTimestamp();
+        for (uint256 d = 1; d <= 6; ++d) {
+            a.mint(alice, 100 + d);
+            vm.warp(t + d * 1 days);
+            _fill(_item(_fixed(alice, 100 + d, 0.3 ether), aliceKey, buyer, 0.3 ether, 1 ether), buyer, 1 ether);
+        }
+        assertEq(_ref(), 0.3 ether); // 1 → .8 → .64 → .512 → .41 → .328 → .3
+    }
+
+    function test_floor_sustainedDropGetsThroughInDays_frequentFills() public {
+        _seed(1 ether);
+        uint256 t = vm.getBlockTimestamp();
+        uint256 i;
+        while (_ref() > 0.3 ether) {
+            ++i;
+            a.mint(alice, 200 + i);
+            vm.warp(t + i * 6 hours);
+            _fill(_item(_fixed(alice, 200 + i, 0.3 ether), aliceKey, buyer, 0.3 ether, 1 ether), buyer, 1 ether);
+        }
+        assertLe(i * 6 hours, 7 days); // fills every 6 hours barely slow it down
+        assertEq(_ref(), 0.3 ether);
+    }
+
+    function test_floor_cosignerSilent_bandOpens_andOnChainStillTrades() public {
+        _seed(1 ether);
+        vm.prank(owner);
+        m.setCosigner(address(0)); // silent for 10 days
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory prices = new uint256[](1);
+        ids[0] = 2;
+        prices[0] = 1 ether;
+        vm.prank(alice);
+        m.list(address(a), ids, prices, vm.getBlockTimestamp() + 30 days);
+        PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 2, 1 ether);
+        vm.prank(buyer);
+        m.buy{value: 1.025 ether}(items, 0);
+        assertEq(a.ownerOf(2), buyer);
+
+        vm.warp(vm.getBlockTimestamp() + 10 days);
+        vm.prank(owner);
+        m.setCosigner(cs);
+        (uint256 c, uint256 low) = m.floorBand(address(a), 0.2 ether);
+        assertEq(low, 0); // fully open after 5 days at −20%/day
+        assertEq(c, 0.2 ether);
+        _fill(_item(_fixed(alice, 1, 0.2 ether), aliceKey, buyer, 0.2 ether, 1 ether), buyer, 1 ether);
+        assertEq(_ref(), 0.2 ether); // not stuck
+    }
+
+    function test_floor_riseCapped() public {
+        _seed(1 ether);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
+        _fill(_item(_followFloor(alice, 1), aliceKey, buyer, 5 ether, 10 ether), buyer, 10 ether);
+        assertEq(_ref(), 1.5 ether); // +50%/day
+    }
+
+    function test_floor_backstopRefusesCheapFill() public {
+        _seed(1 ether);
+        PentagonMarketplaceV3.SignedBuy memory it = _item(_fixed(alice, 1, 0.09 ether), aliceKey, buyer, 1 ether, 1 ether);
+        vm.expectRevert(PentagonMarketplaceV3.BelowFloorBackstop.selector);
+        _fill(it, buyer, 1 ether);
+        _fill(_item(_fixed(alice, 1, 0.1 ether), aliceKey, buyer, 1 ether, 1 ether), buyer, 1 ether); // 10% passes
+    }
+
+    function test_floorParams_bounds() public {
+        vm.startPrank(owner);
+        vm.expectRevert(PentagonMarketplaceV3.BpsTooHigh.selector);
+        m.setFloorParams(499, 5000, 1000);
+        vm.expectRevert(PentagonMarketplaceV3.BpsTooHigh.selector);
+        m.setFloorParams(2000, 100_001, 1000);
+        vm.expectRevert(PentagonMarketplaceV3.BpsTooHigh.selector);
+        m.setFloorParams(2000, 5000, 5001);
+        m.setFloorParams(5000, 500, 0);
+        vm.stopPrank();
+        assertEq(m.floorFallBpsPerDay(), 5000);
+        vm.prank(other);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, other));
+        m.setFloorParams(2000, 5000, 1000);
+    }
+
+    // ───────── flagged tokens (nftprof 2026-11-07) ─────────
+
+    address flaggerAddr = makeAddr("flagger");
+    address claimant = makeAddr("claimant");
+
+    function _flag(uint256 id, address who) internal {
+        vm.prank(owner);
+        m.setFlagger(flaggerAddr);
+        vm.prank(flaggerAddr);
+        m.setFlag(address(a), id, true, who);
+    }
+
+    function _state(uint256 id) internal view returns (uint8 st, uint96 paid) {
+        (st, paid,) = m.flags(address(a), id);
+    }
+
+    /// buyerK (has a key) buys flagged token 1 from alice at 1 ether with the warning acknowledged.
+    function _buyFlagged(bool clear) internal returns (address bk, uint256 bkKey) {
+        (bk, bkKey) = makeAddrAndKey("buyerK");
+        vm.deal(bk, 10 ether);
+        PentagonMarketplaceV3.SignedBuy memory it =
+            _itemX(_fixed(alice, 1, 1 ether), aliceKey, bk, 0, 1 ether, true, clear, new bytes32[](0));
+        _fill(it, bk, 1.025 ether);
+        vm.prank(bk);
+        a.setApprovalForAll(address(m), true);
+    }
+
+    function test_flag_onlyFlagger() public {
+        vm.prank(other);
+        vm.expectRevert(PentagonMarketplaceV3.NotFlagger.selector);
+        m.setFlag(address(a), 1, true, claimant);
+    }
+
+    function test_flag_onChainListingAndOfferRefused() public {
+        _flag(1, claimant);
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory prices = new uint256[](1);
+        ids[0] = 1;
+        prices[0] = 1 ether;
+        vm.prank(alice);
+        m.list(address(a), ids, prices, vm.getBlockTimestamp() + 1 days);
+        PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(PentagonMarketplaceV3.TokenFlagged.selector);
+        m.buy{value: 1.025 ether}(items, 0);
+
+        vm.prank(buyer);
+        uint256 offerId = m.placeOffer{value: 1.025 ether}(address(a), 1 ether, 1, vm.getBlockTimestamp() + 1 days, bytes32(0));
+        vm.prank(alice);
+        vm.expectRevert(PentagonMarketplaceV3.TokenFlagged.selector);
+        m.acceptOffer(offerId, ids, new bytes32[][](0));
+    }
+
+    function test_flag_signedWithoutAckRefused() public {
+        _flag(1, claimant);
+        PentagonMarketplaceV3.SignedBuy memory it = _item(_fixed(alice, 1, 1 ether), aliceKey, buyer, 0, 1 ether);
+        vm.expectRevert(PentagonMarketplaceV3.TokenFlagged.selector);
+        _fill(it, buyer, 2 ether);
+    }
+
+    function test_flag_ackedPurchaseHolds_resaleRefusedOnAllPaths() public {
+        _flag(1, claimant);
+        (address bk, uint256 bkKey) = _buyFlagged(false);
+        assertEq(a.ownerOf(1), bk);
+        (uint8 st, uint96 paid) = _state(1);
+        assertEq(st, 2);
+        assertEq(paid, 1 ether);
+        // signed, even acknowledged
+        PentagonMarketplaceV3.SignedBuy memory it =
+            _itemX(_fixed(bk, 1, 1 ether), bkKey, buyer, 0, 1 ether, true, false, new bytes32[](0));
+        vm.expectRevert(PentagonMarketplaceV3.TokenHeld.selector);
+        _fill(it, buyer, 2 ether);
+        // on-chain listing
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory prices = new uint256[](1);
+        ids[0] = 1;
+        prices[0] = 1 ether;
+        vm.prank(bk);
+        m.list(address(a), ids, prices, vm.getBlockTimestamp() + 1 days);
+        PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1 ether);
+        vm.prank(buyer);
+        vm.expectRevert(PentagonMarketplaceV3.TokenHeld.selector);
+        m.buy{value: 1.025 ether}(items, 0);
+    }
+
+    function test_flag_holdSurvivesOffPlatformTransfer() public {
+        _flag(1, claimant);
+        (address bk,) = _buyFlagged(false);
+        vm.prank(bk);
+        a.transferFrom(bk, other, 1); // the flag binds our marketplace only; the token can still move
+        (uint8 st,) = _state(1);
+        assertEq(st, 2);
+    }
+
+    function test_flag_vipPurchaseClears() public {
+        _flag(1, claimant);
+        (address bk, uint256 bkKey) = _buyFlagged(true);
+        (uint8 st,) = _state(1);
+        assertEq(st, 0);
+        _fill(_item(_fixed(bk, 1, 1 ether), bkKey, buyer, 0, 1 ether), buyer, 1.025 ether);
+        assertEq(a.ownerOf(1), buyer);
+    }
+
+    function test_flag_flaggerClearsHold() public {
+        _flag(1, claimant);
+        (address bk, uint256 bkKey) = _buyFlagged(false);
+        vm.prank(flaggerAddr);
+        m.setFlag(address(a), 1, false, address(0));
+        _fill(_item(_fixed(bk, 1, 1 ether), bkKey, buyer, 0, 1 ether), buyer, 1.025 ether);
+        assertEq(a.ownerOf(1), buyer);
+    }
+
+    function test_flag_reflagHeldKeepsHold() public {
+        _flag(1, claimant);
+        _buyFlagged(false);
+        vm.prank(flaggerAddr);
+        m.setFlag(address(a), 1, true, other);
+        (uint8 st, uint96 paid) = _state(1);
+        assertEq(st, 2);
+        assertEq(paid, 1 ether);
+    }
+
+    function test_flag_claimantBuysBackAtPaid_clears() public {
+        _flag(1, claimant);
+        (address bk,) = _buyFlagged(false);
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory prices = new uint256[](1);
+        ids[0] = 1;
+        prices[0] = 1.5 ether;
+        vm.prank(bk);
+        m.list(address(a), ids, prices, vm.getBlockTimestamp() + 1 days);
+        vm.deal(claimant, 10 ether);
+        PentagonMarketplaceV3.BuyItem[] memory items = new PentagonMarketplaceV3.BuyItem[](1);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1.5 ether);
+        vm.prank(claimant);
+        vm.expectRevert(PentagonMarketplaceV3.AboveClaimantPrice.selector); // above max(paid 1, ref 0)
+        m.buy{value: 2 ether}(items, 0);
+
+        prices[0] = 1 ether;
+        vm.prank(bk);
+        m.list(address(a), ids, prices, vm.getBlockTimestamp() + 1 days);
+        items[0] = PentagonMarketplaceV3.BuyItem(address(a), 1, 1 ether);
+        vm.prank(claimant);
+        m.buy{value: 1.025 ether}(items, 0);
+        assertEq(a.ownerOf(1), claimant);
+        (uint8 st,) = _state(1);
+        assertEq(st, 0);
+    }
+
+    function test_flag_claimantCapIsHigherOfPaidAndRef() public {
+        _seed(2 ether);
+        _flag(1, claimant);
+        // Bought at the 0.5 ether the seller asked (the backstop allows it: 10% of 2 = 0.2).
+        (address bk, uint256 bkKey) = makeAddrAndKey("buyerK");
+        vm.deal(bk, 10 ether);
+        _fill(_itemX(_fixed(alice, 1, 0.5 ether), aliceKey, bk, 2 ether, 1 ether, true, false, new bytes32[](0)), bk, 1 ether);
+        vm.prank(bk);
+        a.setApprovalForAll(address(m), true);
+        // The claimant may pay up to the 2 ether floor ref, above the 0.5 paid.
+        vm.deal(claimant, 10 ether);
+        _fill(_item(_fixed(bk, 1, 1.9 ether), bkKey, claimant, 2 ether, 1.9 ether), claimant, 2 ether);
+        assertEq(a.ownerOf(1), claimant);
+    }
+
+    // ───────── named-wallet orders are free (nftprof 2026-11-07) ─────────
+
+    function _aLeaf(address w) internal pure returns (bytes32) {
+        return keccak256(bytes.concat(keccak256(abi.encode(w))));
+    }
+
+    function _named() internal view returns (PentagonMarketplaceV3.Order memory o) {
+        o = _fixed(alice, 1, 1 ether);
+        o.audienceKind = 1;
+        bytes32 x = _aLeaf(buyer);
+        bytes32 y = _aLeaf(other);
+        o.audience = x < y ? keccak256(abi.encode(x, y)) : keccak256(abi.encode(y, x));
+        o.feeBps = 0;
+        o.royaltyBps = 0;
+    }
+
+    function _proof(address sibling) internal pure returns (bytes32[] memory p) {
+        p = new bytes32[](1);
+        p[0] = _aLeaf(sibling);
+    }
+
+    function test_named_freeLikeListPrivate() public {
+        _fill(_itemX(_named(), aliceKey, buyer, 0, 1 ether, false, false, _proof(other)), buyer, 1 ether);
+        assertEq(a.ownerOf(1), buyer);
+        assertEq(alice.balance, 1 ether);
+        assertEq(m.floorFundOf(address(a)), 0);
+        assertEq(m.royaltyFundOf(address(a)), 0);
+        assertEq(buyer.balance, 99 ether);
+    }
+
+    function test_named_secondWalletInList() public {
+        _fill(_itemX(_named(), aliceKey, other, 0, 1 ether, false, false, _proof(buyer)), other, 1 ether);
+        assertEq(a.ownerOf(1), other);
+    }
+
+    function test_named_notInListRefused() public {
+        address carol = makeAddr("carol");
+        vm.deal(carol, 10 ether);
+        PentagonMarketplaceV3.SignedBuy memory it = _itemX(_named(), aliceKey, carol, 0, 1 ether, false, false, _proof(other));
+        vm.expectRevert(PentagonMarketplaceV3.NotPrivateBuyer.selector);
+        _fill(it, carol, 2 ether);
+    }
+
+    function test_named_badProofRefused() public {
+        PentagonMarketplaceV3.SignedBuy memory it = _itemX(_named(), aliceKey, buyer, 0, 1 ether, false, false, _proof(buyer));
+        vm.expectRevert(PentagonMarketplaceV3.NotPrivateBuyer.selector);
+        _fill(it, buyer, 2 ether);
+    }
+
+    function test_otherAudienceKind_paysFee() public {
+        PentagonMarketplaceV3.Order memory o = _named();
+        o.audienceKind = 2; // co-signer-enforced kind: the root is opaque to the contract, and the fee applies
+        o.feeBps = 250;
+        o.royaltyBps = 250;
+        _fill(_item(o, aliceKey, buyer, 0, 1 ether), buyer, 1.025 ether);
+        assertEq(m.floorFundOf(address(a)), 0.025 ether);
     }
 }
