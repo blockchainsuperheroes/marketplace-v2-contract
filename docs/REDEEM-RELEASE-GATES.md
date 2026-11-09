@@ -21,7 +21,11 @@ Drafted by vip members on 2026-11-09 as blockchainsuperheroes/pg-vip-api PR #4 (
 - **Response:** `registered`, `tier_at_least_bronze`, `linked_at`, `link` (mm or penai). For Points, `wallet_is_this_users` too (requested). Nothing personal.
 - **Registered** means exactly one live account holds the wallet as a bound `mm_address` or as `penai_address`. An address claimed by two or more accounts doesn't count.
 - **Bronze Key** is tier 1; Paper Ticket and Iron Pass are free ranks. `tier_status: "unknown"` means hold, not fail.
-- **`linked_at` null** (there's no mm bind time yet) means the 72h timing.
+- **The hold signal is `recent_link`, not `linked_at`.** A MetaMask link is permanent, and the 543K existing binds have no bind time, so `linked_at: null` means old and trusted. `recent_link` is true for a penai link made in the last 7 days. It must also be true for a new MetaMask link: either a bind time stamped from now on, or, until that exists, an account created in the last 7 days (requested 2026-11-09).
+- **Decision:**
+  - release when `registered` and `tier_at_least_bronze` and not `recent_link` (for Points, also `wallet_is_this_users`);
+  - 72h timing when `recent_link`;
+  - hold when `tier_status: "unknown"`.
 - **The website's pre-payment check calls through our own server.** The key never reaches a browser, or the endpoint becomes a public "is this wallet a VIP" lookup.
 
 ## Gate 3: pooled funds
