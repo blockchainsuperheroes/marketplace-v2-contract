@@ -14,6 +14,16 @@ The existing checks and release timing (1h / 24h / 72h, the daily cap) come afte
 
 **Gates 1 and 2 can be fixed after a claim.** A buyer who registers or upgrades is released at the 72h timing (a new binding), as long as the 6-day release cut-off hasn't passed. Gate 3 has no fix: pay again from a wallet funded directly, or with Points.
 
+## Gates 1 and 2: the lookup
+
+Proposed by vip members on 2026-11-09. Not built yet: it waits on pg-vip-api PR #2 and #3, plus nftprof's go in that session.
+- **Request:** `POST /vip/release_check` on pg-vip-api, with a scoped `Api-Key` for PFP Vault only, rate-limited. The body is `{"wallet":"0x…"}`. For Points, it's `{"pg_user_id":N,"wallet":"0x<deliverTo>"}`.
+- **Response:** `registered`, `tier_at_least_bronze`, `linked_at`, `link` (mm or penai). For Points, `wallet_is_this_users` too (requested). Nothing personal.
+- **Registered** means exactly one live account holds the wallet as a bound `mm_address` or as `penai_address`. An address claimed by two or more accounts doesn't count.
+- **Bronze Key** is tier 1; Paper Ticket and Iron Pass are free ranks. `tier_status: "unknown"` means hold, not fail.
+- **`linked_at` null** (there's no mm bind time yet) means the 72h timing.
+- **The website's pre-payment check calls through our own server.** The key never reaches a browser, or the endpoint becomes a public "is this wallet a VIP" lookup.
+
 ## Gate 3: pooled funds
 
 The check reads only the public Pentagon Chain explorer.
