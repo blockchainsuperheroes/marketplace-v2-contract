@@ -58,3 +58,18 @@ Show one gate at a time, and never show the next gate until the one before passe
 - **Site-wide, low-key** (in place, as if it was always there; no "new" badge or announcement): "Redeem is the members' site for Bronze Key members and above."
 
 Copy rules still apply: no "cash out", no price claims.
+
+## The admin release page
+
+nftprof, 2026-11-09: a claim that fails a gate must be obviously red-flagged on the release page, with the reason.
+
+On `market13.pentagon.games/admin/release` (CI/CD owns this page), every waiting claim gets a gate row:
+- **Pass:** a green "Gates passed" line.
+- **Fail:** a red card with a red "DO NOT RELEASE" header. It lists each failing gate in plain words, e.g.:
+  - "Gate 1: not a registered Pentagon user";
+  - "Gate 3: PC pooled from 2,000+ single-use wallets (ATS faucet)".
+
+  Then "Buyer can reclaim from <date>". The Sign/Release button is disabled. An override needs a typed confirmation (the drop id), and the override is logged.
+- **Unknown** (the lookup failed, or `tier_status: unknown`): an amber "Hold: gates not checked" card. The button is disabled the same way.
+- **Data source:** the indexer computes the gates server-side (`/vip/release_check` with the key from server env, plus `pooledFunds.mjs`) and caches them per drop for about 10 minutes. The page never sees the key.
+- **Held list:** drops on it (today, drop 13) always show red, with the reason, even if a lookup is down.
