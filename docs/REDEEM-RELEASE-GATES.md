@@ -16,8 +16,8 @@ The existing checks and release timing (1h / 24h / 72h, the daily cap) come afte
 
 ## Gates 1 and 2: the lookup
 
-Proposed by vip members on 2026-11-09. Not built yet: it waits on pg-vip-api PR #2 and #3, plus nftprof's go in that session.
-- **Request:** `POST /vip/release_check` on pg-vip-api, with a scoped `Api-Key` for PFP Vault only, rate-limited. The body is `{"wallet":"0x…"}`. For Points, it's `{"pg_user_id":N,"wallet":"0x<deliverTo>"}`.
+Drafted by vip members on 2026-11-09 as blockchainsuperheroes/pg-vip-api PR #4 (read-only tests against prod: 12 cases pass; the drop #13 buyer returns `registered:false`). Not deployed yet: it deploys after pg-vip-api PR #2 and #3, each on nftprof's go in that session.
+- **Request:** `POST https://api.account.pentagon.games/user/vip/release_check` with header `Api-Key: <RELEASE_CHECK_KEY>`. The key is scoped to PFP Vault only, rate-limited, and set in our server env at deploy time. The body is `{"wallet":"0x…"}`. For Points, it's `{"pg_user_id":N,"wallet":"0x<deliverTo>"}`.
 - **Response:** `registered`, `tier_at_least_bronze`, `linked_at`, `link` (mm or penai). For Points, `wallet_is_this_users` too (requested). Nothing personal.
 - **Registered** means exactly one live account holds the wallet as a bound `mm_address` or as `penai_address`. An address claimed by two or more accounts doesn't count.
 - **Bronze Key** is tier 1; Paper Ticket and Iron Pass are free ranks. `tier_status: "unknown"` means hold, not fail.
