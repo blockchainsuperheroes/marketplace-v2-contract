@@ -73,3 +73,29 @@ On `market13.pentagon.games/admin/release` (CI/CD owns this page), every waiting
 - **Unknown** (the lookup failed, or `tier_status: unknown`): an amber "Hold: gates not checked" card. The button is disabled the same way.
 - **Data source:** the indexer computes the gates server-side (`/vip/release_check` with the key from server env, plus `pooledFunds.mjs`) and caches them per drop for about 10 minutes. The page never sees the key.
 - **Held list:** drops on it (today, drop 13) always show red, with the reason, even if a lookup is down.
+
+## The buyer's journey on a held claim
+
+nftprof, 2026-11-09: the buyer is guided step by step: create an account, then become a paying member, and only then told about pooled PC. One step on screen at a time.
+
+The buyer's own claim card on Redeem (wallet connected, "My claims"), always with: the piece, "Paid 2 PC", "Reclaim available from <date>".
+
+**Step 1: not registered.** Status: "Waiting for your account".
+- "Redeem is the members' site. This wallet isn't linked to a Pentagon account yet."
+- [Create your Pentagon account] → sign up, then sign the wallet link.
+- Small print: "Your claim stays reserved while you finish. Release checks continue after each step."
+
+**Step 2: registered, below Bronze Key.** Status: "Waiting for membership".
+- "Redeem is for Bronze Key members and above."
+- [Become a Bronze Key member] → members.pentagon.games, which shows the Stripe payment. The payment shows up in `release_check` as `tier_at_least_bronze`.
+- Same small print.
+
+**Step 3: member, PC pooled.** Status: "Can't be released".
+- "This claim was paid with PC gathered from many other wallets, which Redeem doesn't accept. Your membership stays active. You can reclaim your 2 PC from <date>, and buy again with Points or from a wallet you funded directly."
+- [Reclaim my PC], enabled from the date.
+
+**All pass:** "Checks passed. Delivery within <timing>". The usual release timing applies, and new accounts get 72h.
+
+**Honesty rule.** No step may promise release. Steps 1 and 2 always say that more checks follow. Membership is sold as membership, never as "pay to release this claim".
+
+**No account means no email.** A wallet without an account can only be reached on the site, so the card is the only channel until step 1 is done.
