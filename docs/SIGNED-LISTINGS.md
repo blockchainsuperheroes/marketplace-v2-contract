@@ -137,11 +137,43 @@ It signs a `FillAuth` only when **all** of these hold:
   - `clearStale`;
   - nonce shared between both listing kinds.
 - **Reentrancy:** the guard on `buySigned`, and payouts deferred to `withdraw`.
-- **The invariant suite:** extend `test/MarketplaceV3.invariant.t.sol`'s handler with `buySigned` (all kinds, flags), `cancelOrders`, fee/royalty changes, floor seeding and flags. Solvency (the funds plus pending payouts) must hold.
+- **The invariant suite:** extended on 2026-11-14 (see "Tests"). Still to re-run on this version: Medusa and Echidna (the harness exposes the new property), Halmos, Mythril, the static tools, the 1M-call Foundry run, and the mainnet-fork check.
 
 ## Tests
 - `test/MarketplaceV3Signed.t.sol`: 72 tests, including a fuzz test of the price bounds.
 - Full suite: 264 passed, 0 failed, 1 skipped (that test was already skipped before this change).
+
+### The invariant suite covers signed listings (2026-11-14)
+`test/MarketplaceV3.invariant.t.sol`. The contract is unchanged (`c491f88`).
+
+**What the handler now does,** alongside everything it did before:
+- sellers sign orders: fixed price, time ramps and floor-following rules; for everyone, for named wallets, or co-signer-enforced; from EOAs and from ERC-1271 smart wallets. Some are malformed or stale on purpose;
+- buyers fill one or two orders per call with a co-signer FillAuth: a wrong or missing co-signer, a wrong seller key, an expired or over-long auth, a short payment, an over-cap tip and a price above `maxPrice` are all tried;
+- sellers cancel by hash; just before some fills the seller cancels everything, or that order, or the flagger flags the token;
+- the owner changes the co-signer, the flagger and the floor parameters, and seeds floor references; strangers try each of those;
+- the flagger flags, renames claimants and clears.
+
+**How it checks.** An independent model (its own floor band, price rule, EIP-712 hashes and flag rules) decides before each fill whether it must go through. Both directions are violations: a fill the rules refuse that goes through, and a fill the rules allow that is refused (the contract's error is recorded). Every payment and NFT move is compared exactly, as before. A new invariant, `invariant_signedStateMatchesModel`, compares the co-signer, flagger, floor parameters, every floor reference, every flag and every tracked order's status with the model.
+
+**Results:**
+- Default size (7 invariants x 256 runs x 500 calls): all pass.
+- Deep run (120 runs x 6,000 calls = 720,000 calls, handler calls not reverted so old orders stay in play): passes.
+- **No contract bug found.**
+
+**The suite is shown to bite.** 28 bugs were planted one at a time in a copy of the signed-listing code (96 runs each); all 28 are caught:
+- a filled order not marked filled; a cancelled order still fillable; `incrementNonce` not cancelling signed orders; an order fillable after expiry; `cancelOrders` cancelling a filled order;
+- the seller's signature unchecked; the co-signer's signature unchecked; a FillAuth good for longer than 5 minutes; anyone naming the co-signer;
+- named-wallet orders charged the fee; anyone filling a named-wallet order;
+- the price not capped at `priceMax`; the buyer's `maxPrice` ignored; the fee taken at the signed rate; the royalty taken at the signed rate when today's is higher; rates above what the seller signed accepted;
+- no floor backstop; the floor not clamped at the top of the band; not clamped at the bottom; a fill not moving the reference; the reference re-seedable;
+- a held token sold on; a flagged token sold without the acknowledgement; `clearFlag` ignored; no cap on the claimant's buy-back; anyone setting a flag;
+- `buySigned` unguarded against re-entry; a fill leaving the token's on-chain listing in place.
+
+The first version of this check caught only 26. When the model expected a refusal it offered `maxPrice = 0`, so the contract refused for that alone and a missing check further on could hide. The handler now always offers the true price.
+
+**One behaviour to know (not a bug).** A smart-wallet seller can act when it is paid. If it calls `incrementNonce()` on receiving payment for the first of two of its orders in one purchase, its second order is cancelled and the whole purchase reverts. The same holds for `buy()` with two of its listings. A purchase is all-or-nothing by design, so the sweep in the trader view should retry without the failing item.
+
+**Not done yet:** Medusa, Echidna, Halmos, Mythril, the static tools, the 1M-call Foundry run and the mainnet-fork check on this version; then the external audit.
 
 ## Open questions for nftprof
 1. Should `acceptFeeChanges` also cover royalty raises? The coordinator's call was yes; please confirm.

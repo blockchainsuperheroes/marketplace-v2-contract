@@ -18,6 +18,12 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 ///     in the offer's / listing's own collection.
 /// Anything unexpected is recorded as a violation and fails invariant_noHandlerViolations.
 ///
+/// Signed listings (be39502, c491f88): sellers sign EIP-712 orders (fixed price, time ramps, floor-following
+/// rules; everyone / named wallets / co-signer audiences), buyers fill them with a co-signer FillAuth, the
+/// flagger flags tokens. For every signed fill the model decides beforehand whether it must succeed, and
+/// both directions are violations: a fill the rules refuse that goes through, and a fill the rules allow
+/// that reverts.
+///
 /// Run (high effort, used for docs/AUDIT-SELF-REVIEW.md):
 ///   FOUNDRY_INVARIANT_RUNS=2000 FOUNDRY_INVARIANT_DEPTH=200 FOUNDRY_FUZZ_RUNS=20000 \
 ///     forge test --match-path test/MarketplaceV3.invariant.t.sol
@@ -72,6 +78,18 @@ contract TrickyWallet {
         mode = x;
     }
 
+    address public signer; // ERC-1271: a signature by this key counts as the wallet's own
+
+    function setSigner(address s) external {
+        signer = s;
+    }
+
+    function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
+        if (sig.length != 65) return 0xffffffff;
+        address rec = ecrecover(hash, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64]));
+        return rec != address(0) && rec == signer ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
+    }
+
     receive() external payable {
         uint8 md = mode;
         if (md == 1) revert("rejecting");
@@ -86,6 +104,9 @@ contract TrickyWallet {
                 reentryWorked = true;
             } catch {}
             try m.incrementNonce() {} catch {} // allowed: not guarded, only affects this wallet's listings
+            try m.buySigned(new M.SignedBuy[](0), 0) {
+                reentryWorked = true;
+            } catch {}
         }
     }
 }
@@ -120,6 +141,45 @@ contract Handler is Test {
     mapping(address => bool) public gBlocked;
     bool public selfServe;
     address public gGuardian;
+
+    // ── signed listings, the floor reference and flags (be39502, c491f88) ──
+    bytes32 internal constant ORDER_TYPEHASH_ = keccak256(
+        "Order(address seller,address collection,uint256 tokenId,uint96 startPrice,uint96 endPrice,uint40 rampStart,uint40 rampEnd,uint128 floorRef,uint16 upBps,uint16 downBps,uint96 priceMin,uint96 priceMax,bytes32 audience,uint8 audienceKind,uint16 feeBps,uint16 royaltyBps,bool acceptFeeChanges,uint64 nonce,uint40 start,uint40 expiry,uint256 salt)"
+    );
+    bytes32 internal constant FILL_AUTH_TYPEHASH_ =
+        keccak256("FillAuth(bytes32 orderHash,address buyer,uint128 floor,uint40 deadline,bool flagAck,bool clearFlag)");
+
+    struct SO {
+        M.Order o;
+        bytes32 h; // its EIP-712 digest, and its id in orderStatus
+        address namedA; // AUDIENCE_NAMED: the wallets in the order's Merkle root
+        address namedB; // 0 = one wallet only
+    }
+
+    struct GF {
+        uint8 state; // 1 flagged, 2 held
+        uint96 paid;
+        address claimant;
+    }
+
+    uint256 internal constant SO_MAX = 16;
+    SO[] internal orders; // the last SO_MAX orders signed (a ring)
+    uint256 internal soNext;
+    uint256 internal saltCounter;
+    mapping(address => uint256) internal keyOf; // each actor's signing key (smart wallets: their ERC-1271 signer's)
+    uint256[2] internal csKeys;
+    address[2] internal csAddrs;
+    address[2] internal flaggers;
+    uint256 internal strangerKey;
+    address public gCosigner;
+    address public gFlagger;
+    uint16 public gFall = 2000;
+    uint32 public gRise = 5000;
+    uint16 public gBackstop = 1000;
+    mapping(address => uint256) public gRef; // model of floorRefs[c].ref
+    mapping(address => uint256) public gRefAt; // and of .updatedAt
+    mapping(address => mapping(uint256 => GF)) internal gFlag; // model of flags
+    mapping(address => mapping(bytes32 => uint8)) public gOS; // model of orderStatus (1 filled, 2 cancelled)
 
     // ── model of listings / offers ──
     struct GL {
@@ -221,6 +281,30 @@ contract Handler is Test {
         for (uint256 i; i < receivers.length; ++i) tracked.push(receivers[i]);
         tracked.push(owner);
         tracked.push(makeAddr("stranger"));
+
+        // signed listings: every actor can sign (the smart wallets through ERC-1271); a co-signer and a
+        // flagger are set
+        string[3] memory names = ["alice", "bob", "carol"];
+        for (uint256 i; i < 3; ++i) {
+            keyOf[actors[i]] = uint256(keccak256(abi.encodePacked(names[i])));
+            require(vm.addr(keyOf[actors[i]]) == actors[i], "actor key");
+        }
+        uint256 wk = uint256(keccak256("walletSigner"));
+        for (uint256 i; i < 2; ++i) {
+            wallets[i].setSigner(vm.addr(wk));
+            keyOf[address(wallets[i])] = wk;
+            csKeys[i] = uint256(keccak256(abi.encodePacked("cosigner", i)));
+            csAddrs[i] = vm.addr(csKeys[i]);
+        }
+        flaggers[0] = makeAddr("flaggerA");
+        flaggers[1] = makeAddr("flaggerB");
+        strangerKey = uint256(keccak256("strangerKey"));
+        vm.startPrank(owner);
+        m.setCosigner(csAddrs[0]);
+        m.setFlagger(flaggers[0]);
+        vm.stopPrank();
+        gCosigner = csAddrs[0];
+        gFlagger = flaggers[0];
     }
 
     // ───────────────────────────── views for the test contract ─────────────────────────────
@@ -255,6 +339,14 @@ contract Handler is Test {
 
     function ghostOffer(uint256 id) external view returns (GO memory) {
         return go[id];
+    }
+
+    function ghostFlag(address c, uint256 id) external view returns (GF memory) {
+        return gFlag[c][id];
+    }
+
+    function orderCount() external view returns (uint256) {
+        return orders.length;
     }
 
     // ───────────────────────────── helpers ─────────────────────────────
@@ -665,6 +757,11 @@ contract Handler is Test {
         // a private listing's named buyer usually buys it; anyone else must be refused
         address pb0 = gPriv[items[0].collection][items[0].tokenId];
         if (pb0 != address(0) && mode % 3 != 0) x.buyer = pb0;
+        {
+            // a flagged token's claimant sometimes buys it back through its on-chain listing
+            GF memory f0 = gFlag[items[0].collection][items[0].tokenId];
+            if (f0.state != 0 && f0.claimant != address(0) && pb0 == address(0) && mode % 4 == 1) x.buyer = f0.claimant;
+        }
         if (mode % 11 == 2 && ls[0].seller != address(0)) {
             x.buyer = ls[0].seller; // self-trade attempt
             x.mustFail = true;
@@ -714,6 +811,7 @@ contract Handler is Test {
                 if (!gAllowed[items[i].collection]) _v("buy: collection not allowed");
                 if (l.price > items[i].maxPrice) _v("buy: price above maxPrice");
                 if (l.feeBps > m.MAX_FEE_BPS() || l.royaltyBps > m.MAX_ROYALTY_BPS()) _v("buy: bps over cap");
+                _plainSaleFlag(items[i].collection, items[i].tokenId, x.buyer, l.price, "buy");
                 maxPaid += items[i].maxPrice + (items[i].maxPrice * l.feeBps) / 10_000;
                 address pb = gPriv[items[i].collection][items[i].tokenId];
                 if (pb != address(0)) {
@@ -901,6 +999,7 @@ contract Handler is Test {
                 if (o.kind != 0 && x.ids[i] != o.idA && (o.kind == 1 || x.ids[i] != o.idB)) {
                     _v("acceptOffer: token outside the offer's set");
                 }
+                _plainSaleFlag(x.c, x.ids[i], o.bidder, o.price, "acceptOffer");
                 _clearListing(x.c, x.ids[i]);
             }
             go[x.oid].remaining -= uint16(x.ids.length);
@@ -1342,7 +1441,7 @@ contract Handler is Test {
         _begin();
         bool ok;
         vm.startPrank(who);
-        uint8 w = which % 13;
+        uint8 w = which % 18;
         if (w == 0) try m.setFee(1) { ok = true; } catch {}
         if (w == 1) try m.setDefaultRoyalty(0) { ok = true; } catch {}
         if (w == 2) try m.registerRoyalty(address(nfts[0]), who, 1000) { ok = true; } catch {}
@@ -1362,9 +1461,762 @@ contract Handler is Test {
         if (w == 10) ok = SelfServe.setBlocked(m, address(nfts[0]), true);
         if (w == 11) try m.setTipJar(who) { ok = true; } catch {}
         if (w == 12) try m.setCreatorAllowance(address(nfts[0]), type(uint256).max) { ok = true; } catch {}
+        if (w == 13) try m.setCosigner(who) { ok = true; } catch {}
+        if (w == 14) try m.setFlagger(who) { ok = true; } catch {}
+        if (w == 15) try m.setFloorParams(5000, 500, 0) { ok = true; } catch {}
+        if (w == 16) try m.seedFloorRef(address(nfts[2]), 1) { ok = true; } catch {}
+        if (w == 17) try m.setFlag(address(nfts[0]), 1, true, who) { ok = true; } catch {} // actors are never the flagger
         vm.stopPrank();
         if (ok) _v("strangerAdmin: a non-owner used an owner power");
         _end(ok, "strangerAdmin");
+    }
+
+    // ───────────────────────────── signed listings ─────────────────────────────
+
+    function _sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// Leaf of a named-wallet order's Merkle root (OpenZeppelin StandardMerkleTree over ["address"]).
+    function _wleaf(address a) internal pure returns (bytes32) {
+        return keccak256(bytes.concat(keccak256(abi.encode(a))));
+    }
+
+    function _domain() internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("PentagonMarketplaceV3"),
+                keccak256("1"),
+                block.chainid,
+                address(m)
+            )
+        );
+    }
+
+    /// The EIP-712 digest of an Order, built field by field from the type string a wallet shows the seller
+    /// (not with the contract's abi.encode(TYPEHASH, order) shortcut).
+    function _orderDigest(M.Order memory o) internal view returns (bytes32) {
+        bytes memory a = abi.encode(
+            ORDER_TYPEHASH_, o.seller, o.collection, o.tokenId, o.startPrice, o.endPrice, o.rampStart, o.rampEnd, o.floorRef, o.upBps, o.downBps
+        );
+        bytes memory b = abi.encode(
+            o.priceMin, o.priceMax, o.audience, o.audienceKind, o.feeBps, o.royaltyBps, o.acceptFeeChanges, o.nonce, o.start, o.expiry, o.salt
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _domain(), keccak256(bytes.concat(a, b))));
+    }
+
+    function _authDigest(bytes32 oh, address buyer, uint128 floor, uint40 dl, bool ack, bool clear)
+        internal
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked("\x19\x01", _domain(), keccak256(abi.encode(FILL_AUTH_TYPEHASH_, oh, buyer, floor, dl, ack, clear)))
+        );
+    }
+
+    /// Independent model of floorBand: the co-signer's F clamped to the band around the reference, and the
+    /// band's low end.
+    function _band(address c, uint256 F) internal view returns (uint256 f, uint256 low) {
+        uint256 ref = gRef[c];
+        if (ref == 0) return (F, F);
+        uint256 dt = block.timestamp - gRefAt[c];
+        uint256 fall = (dt * gFall) / 1 days;
+        low = fall >= 10_000 ? 0 : (ref * (10_000 - fall)) / 10_000;
+        uint256 high = (ref * (10_000 + (dt * gRise) / 1 days)) / 10_000;
+        f = F < low ? low : F > high ? high : F;
+    }
+
+    /// Independent model of priceAt, in plain arithmetic: (the rule is well formed, the price now).
+    function _modelPrice(M.Order memory o, uint256 f) internal view returns (bool, uint256 p) {
+        if (o.priceMin == 0 || o.priceMin > o.priceMax || o.rampStart > o.rampEnd) return (false, 0);
+        if (o.upBps > 10_000 || o.downBps > 10_000) return (false, 0);
+        if (o.floorRef == 0 && (o.upBps != 0 || o.downBps != 0)) return (false, 0);
+        uint256 t = block.timestamp;
+        if (t <= o.rampStart) {
+            p = o.startPrice;
+        } else if (t >= o.rampEnd) {
+            p = o.endPrice;
+        } else {
+            uint256 span = uint256(o.rampEnd) - o.rampStart;
+            uint256 gone = t - o.rampStart;
+            p = o.endPrice >= o.startPrice
+                ? o.startPrice + (uint256(o.endPrice - o.startPrice) * gone) / span
+                : o.startPrice - (uint256(o.startPrice - o.endPrice) * gone) / span;
+        }
+        if (o.floorRef != 0 && (o.upBps != 0 || o.downBps != 0)) {
+            uint256 r = (f * 1e18) / o.floorRef;
+            uint256 factor =
+                r >= 1e18 ? 1e18 + ((r - 1e18) * o.upBps) / 10_000 : 1e18 - ((1e18 - r) * o.downBps) / 10_000;
+            p = p * (factor / 1e18) + (p * (factor % 1e18)) / 1e18; // = floor(p * factor / 1e18), without overflow
+        }
+        if (p < o.priceMin) p = o.priceMin;
+        if (p > o.priceMax) p = o.priceMax;
+        return (true, p);
+    }
+
+    /// A seller signs an order (no transaction). The handler keeps the last SO_MAX of them. Most are what
+    /// the listing UI would produce; some are malformed, already stale, or signed by someone who does not own
+    /// the token, and the model must refuse those at fill time.
+    function signOrder(uint256 cSeed, uint256 idSeed, uint256 p1, uint256 p2, uint256 shape, uint256 dur, uint8 mode)
+        external
+    {
+        mode = uint8(uint256(keccak256(abi.encode(mode, shape)))); // spread: the fuzzer favours 0 and 255
+        address c = mode % 4 != 0 ? _allowedCollection(cSeed) : address(nfts[cSeed % 3]);
+        _makeOrder(c, idSeed % TOKENS + 1, p1, p2, shape, dur, mode);
+        _count("signOrder");
+    }
+
+    /// The first allowed collection at or after cSeed (that one itself if none is allowed).
+    function _allowedCollection(uint256 cSeed) internal view returns (address) {
+        for (uint256 k; k < 3; ++k) {
+            address c = address(nfts[(cSeed % 3 + k) % 3]);
+            if (gAllowed[c]) return c;
+        }
+        return address(nfts[cSeed % 3]);
+    }
+
+    /// Sign one order for token `id` of `c` and keep it; returns its slot in `orders`.
+    function _makeOrder(address c, uint256 id, uint256 p1, uint256 p2, uint256 shape, uint256 dur, uint8 mode)
+        internal
+        returns (uint256 slot)
+    {
+        SO memory s;
+        M.Order memory o;
+        o.collection = c;
+        o.tokenId = id;
+        o.seller = InvNFT(o.collection).ownerOf(o.tokenId);
+        if (mode % 13 == 2) o.seller = actors[(mode / 13) % actors.length]; // maybe not the owner
+        if (mode % 4 != 0 && !InvNFT(o.collection).isApprovedForAll(o.seller, address(m))) {
+            vm.prank(o.seller);
+            InvNFT(o.collection).setApprovalForAll(address(m), true);
+        }
+        p1 = bound(p1, 1, 50 ether);
+        p2 = bound(p2, 1, 50 ether);
+        if (shape % 4 < 2) {
+            // a fixed price
+            o.startPrice = o.endPrice = o.priceMin = o.priceMax = uint96(p1);
+        } else {
+            // a price that moves with time and, for shape % 4 == 3, with the floor
+            o.startPrice = uint96(p1);
+            o.endPrice = uint96(p2);
+            o.rampStart = uint40(block.timestamp + (shape / 4) % 3 days);
+            o.rampEnd = o.rampStart + uint40((shape / 1e6) % 30 days);
+            o.priceMin = uint96((p1 < p2 ? p1 : p2) / (1 + (shape / 7) % 3));
+            if (o.priceMin == 0) o.priceMin = 1;
+            o.priceMax = uint96((p1 < p2 ? p2 : p1) * (1 + (shape / 11) % 3));
+            if (shape % 4 == 3) {
+                o.floorRef = uint128(bound(shape / 1e9, 1e15, 100 ether));
+                o.upBps = uint16((shape / 13) % 10_001);
+                o.downBps = uint16((shape / 17) % 10_001);
+            }
+        }
+        uint256 ak = (shape / 5) % 6; // 0-2 everyone, 3-4 named wallets, 5 enforced by the co-signer
+        if (ak == 3 || ak == 4) {
+            o.audienceKind = 1;
+            s.namedA = actors[(shape / 23) % actors.length];
+            if (s.namedA == o.seller) s.namedA = actors[((shape / 23) % actors.length + 1) % actors.length];
+            if (ak == 4) s.namedB = actors[(shape / 29) % actors.length];
+            if (s.namedB == s.namedA) s.namedB = address(0);
+            o.audience = s.namedB == address(0) ? _wleaf(s.namedA) : _hashPair(_wleaf(s.namedA), _wleaf(s.namedB));
+        } else if (ak == 5) {
+            o.audienceKind = 2;
+            o.audience = keccak256("collectors only");
+        }
+        o.feeBps = gFee;
+        o.royaltyBps = _royBps(o.collection);
+        o.acceptFeeChanges = mode % 3 != 0;
+        o.nonce = m.sellerNonce(o.seller);
+        o.start = uint40(block.timestamp);
+        o.expiry = uint40(block.timestamp + bound(dur, 1, 180 days));
+        o.salt = ++saltCounter;
+        // orders no listing UI would produce
+        if (mode % 17 == 5) o.priceMin = o.priceMax + 1;
+        if (mode % 19 == 6) o.expiry = o.start + uint40(180 days + 1);
+        if (mode % 23 == 7) o.start = uint40(block.timestamp + 1 days);
+        if (mode % 29 == 8) o.upBps = 10_001;
+        s.o = o;
+        s.h = m.hashOrder(o);
+        if (s.h != _orderDigest(o)) _v("hashOrder: not the EIP-712 hash of the Order type");
+        if (orders.length < SO_MAX) {
+            slot = orders.length;
+            orders.push(s);
+        } else {
+            slot = soNext % SO_MAX;
+            orders[slot] = s;
+        }
+        ++soNext;
+    }
+
+    struct SBuy {
+        address buyer;
+        uint256 n;
+        uint256 total;
+        uint256 value;
+        uint256 tip;
+        bool expectOk;
+        bool ok;
+        bool badDigest;
+        bytes4 err; // the error the marketplace gave, when it refused
+        bool lenient; // the second fill may legitimately fail (see buySigned)
+        uint256[2] slot;
+        uint256[2] price;
+        uint256[2] fee;
+        uint256[2] roy;
+        bool[2] simOk;
+        uint8[2] flagBefore;
+        address[2] claimantBefore;
+    }
+
+    struct Snap {
+        uint256[3] ref;
+        uint256[3] refAt;
+        GF[2] flag;
+        uint8[2] os;
+    }
+
+    /// An order that is open, current, in its time window and still backed by the token (found = true), not
+    /// on the token of order `avoid`; any order if there is none. `orders` must not be empty.
+    function _pickOrder(uint256 seed, uint256 avoid) internal view returns (uint256, bool found) {
+        uint256 cnt = orders.length;
+        for (uint256 k; k < cnt; ++k) {
+            uint256 idx = (seed % cnt + k) % cnt;
+            SO storage s = orders[idx];
+            if (gOS[s.o.seller][s.h] != 0 || s.o.nonce != m.sellerNonce(s.o.seller)) continue;
+            if (!gAllowed[s.o.collection]) continue;
+            if (block.timestamp < s.o.start || block.timestamp > s.o.expiry) continue;
+            if (InvNFT(s.o.collection).ownerOf(s.o.tokenId) != s.o.seller) continue;
+            if (avoid != type(uint256).max && _sameToken(idx, avoid)) continue;
+            return (idx, true);
+        }
+        return (seed % cnt, false);
+    }
+
+    /// A token the model has as held (looked for first) or flagged, scanning from `seed`.
+    function _findFlagged(uint256 seed) internal view returns (bool, address c, uint256 id) {
+        for (uint8 want = 2; want > 0; --want) {
+            for (uint256 k; k < 3 * TOKENS; ++k) {
+                uint256 t = (seed % (3 * TOKENS) + k) % (3 * TOKENS);
+                c = address(nfts[t / TOKENS]);
+                id = t % TOKENS + 1;
+                if (gFlag[c][id].state == want) return (true, c, id);
+            }
+        }
+        return (false, address(0), 0);
+    }
+
+    /// Just before a fill, sometimes: the seller cancels everything (incrementNonce) or this one order, or the
+    /// flagger flags the token. The fill that follows must then be refused, or go down the flagged path.
+    function _lastMoment(SBuy memory x, uint256 bits) internal {
+        SO storage s = orders[x.slot[0]];
+        uint256 pre = (bits >> 64) % 40;
+        if (pre == 0) {
+            vm.prank(s.o.seller);
+            m.incrementNonce();
+        } else if (pre == 1 && gOS[s.o.seller][s.h] == 0) {
+            bytes32[] memory hs = new bytes32[](1);
+            hs[0] = s.h;
+            vm.prank(s.o.seller);
+            m.cancelOrders(hs);
+            gOS[s.o.seller][s.h] = 2;
+        } else if (pre < 6 && gFlagger != address(0) && gFlag[s.o.collection][s.o.tokenId].state == 0) {
+            address claimant = (bits >> 72) % 3 == 0 ? address(0) : actors[(bits >> 80) % actors.length];
+            vm.prank(gFlagger);
+            m.setFlag(s.o.collection, s.o.tokenId, true, claimant);
+            gFlag[s.o.collection][s.o.tokenId] = GF(1, 0, claimant);
+            _count(keccak256("buySigned.pre.flag"));
+        }
+    }
+
+    /// The second order of a two-order fill: an open order on another token, else a fresh one on the next
+    /// token of the same collection (so the second fill meets the floor band right after it moved). Sometimes
+    /// any order at all, the first one included.
+    function _secondOrder(uint256 first, uint256 pick, uint256 bits, uint8 mode) internal returns (uint256 slot) {
+        if (mode % 7 == 0) {
+            (slot,) = _pickOrder(pick / 3 + 1, type(uint256).max);
+            return slot;
+        }
+        bool found;
+        (slot, found) = _pickOrder(pick / 3 + 1, first);
+        if (found) return slot;
+        if (orders.length == SO_MAX && soNext % SO_MAX == first) ++soNext; // do not overwrite the first order
+        uint256 r = uint256(keccak256(abi.encode(pick, bits, first)));
+        address c = orders[first].o.collection;
+        uint256 p = r >> 8;
+        uint256 ref = gRef[c];
+        if (ref != 0 && ref < 100 ether) p = bound(p, ref / 4 + 1, ref * 2 > 50 ether ? 50 ether : ref * 2);
+        return _makeOrder(c, orders[first].o.tokenId % TOKENS + 1, p, r >> 40, r >> 72, r >> 104, 1);
+    }
+
+    /// The first order to fill. Mostly one that should go through: an open order if there is one, else a
+    /// freshly signed one (sometimes on a flagged token, so the flag paths are walked). Sometimes any order.
+    function _firstOrder(uint256 pick, uint256 bits, uint8 mode) internal returns (uint256 slot) {
+        if (mode % 5 == 0 && orders.length > 0) return pick % orders.length;
+        uint256 r = uint256(keccak256(abi.encode(pick, bits)));
+        uint8 clean = [1, 3, 10, 11][r % 4]; // modes that make a well-formed order (3: no fee changes accepted)
+        (bool hasFlag, address fc, uint256 fid) = _findFlagged(pick);
+        if (hasFlag && gAllowed[fc] && bits % 2 == 1) return _makeOrder(fc, fid, r >> 8, r >> 40, r >> 72, r >> 104, clean);
+        bool found;
+        if (orders.length > 0) (slot, found) = _pickOrder(pick, type(uint256).max);
+        if (!found) {
+            address c = _allowedCollection(pick);
+            uint256 p = r >> 8;
+            uint256 ref = gRef[c];
+            if (ref != 0 && ref < 100 ether) p = bound(p, ref / 4 + 1, ref * 2 > 50 ether ? 50 ether : ref * 2);
+            slot = _makeOrder(c, (pick / 3) % TOKENS + 1, p, r >> 40, r >> 72, r >> 104, clean);
+        }
+    }
+
+    function _sameToken(uint256 a, uint256 b) internal view returns (bool) {
+        return orders[a].o.collection == orders[b].o.collection && orders[a].o.tokenId == orders[b].o.tokenId;
+    }
+
+    function _pickBuyer(SO storage s, uint256 seed, uint8 mode) internal view returns (address b) {
+        b = actors[seed % actors.length];
+        if (s.o.audienceKind == 1 && mode % 8 != 0) b = s.namedA; // a named order's wallet usually buys it
+        GF memory fl = gFlag[s.o.collection][s.o.tokenId];
+        if (fl.state != 0 && fl.claimant != address(0) && mode % 4 == 1) b = fl.claimant; // a buy-back
+        if (mode % 11 == 2) b = s.o.seller; // self-trade attempt
+        else if (b == s.o.seller) b = actors[(seed % actors.length + 1) % actors.length];
+    }
+
+    /// The co-signer's F: sometimes none, sometimes anything, mostly near the reference (or the order's price).
+    function _pickFloor(M.Order memory o, uint256 r, uint8 mode) internal view returns (uint128) {
+        uint256 k = r % 8;
+        if (k == 0) return 0;
+        if (k == 1) return uint128(bound(r >> 8, 1e15, 200 ether));
+        if (k == 7 && mode % 29 == 3) return type(uint128).max;
+        uint256 base = gRef[o.collection] != 0 ? gRef[o.collection] : o.floorRef != 0 ? o.floorRef : o.startPrice;
+        uint256 F = (base * bound(r >> 8, 2_000, 30_000)) / 10_000;
+        return F > type(uint128).max ? type(uint128).max : uint128(F);
+    }
+
+    function _snapshot(SBuy memory x) internal view returns (Snap memory sn) {
+        for (uint256 c; c < 3; ++c) {
+            sn.ref[c] = gRef[address(nfts[c])];
+            sn.refAt[c] = gRefAt[address(nfts[c])];
+        }
+        for (uint256 i; i < x.n; ++i) {
+            SO storage s = orders[x.slot[i]];
+            sn.flag[i] = gFlag[s.o.collection][s.o.tokenId];
+            sn.os[i] = gOS[s.o.seller][s.h];
+        }
+    }
+
+    function _restore(SBuy memory x, Snap memory sn) internal {
+        for (uint256 c; c < 3; ++c) {
+            gRef[address(nfts[c])] = sn.ref[c];
+            gRefAt[address(nfts[c])] = sn.refAt[c];
+        }
+        for (uint256 i; i < x.n; ++i) {
+            SO storage s = orders[x.slot[i]];
+            gFlag[s.o.collection][s.o.tokenId] = sn.flag[i];
+            gOS[s.o.seller][s.h] = sn.os[i];
+        }
+    }
+
+    /// The model's verdict on one signed fill, applied to the model as the contract would apply it:
+    /// (it must succeed, price, fee, royalty). The caller rolls the model back if the real call fails.
+    /// Not covered here (the caller covers them): the two signatures, the auth window, maxPrice, payment.
+    ///
+    /// The price and fee are worked out even when the fill must be refused, so the buyer always offers the
+    /// true price and enough money. Otherwise the marketplace would refuse for PriceAboveMax alone and a
+    /// missing check further on (a cancelled order, a held token, the claimant's cap) could never show.
+    function _simFill(SO storage s, address buyer, uint256 F, bool ack, bool clear, bool inSet)
+        internal
+        returns (bool ok, uint256 price, uint256 fee, uint256 roy)
+    {
+        M.Order memory o = s.o;
+        address c = o.collection;
+        bool named = o.audienceKind == 1;
+        ok = gOS[o.seller][s.h] == 0 && o.seller != buyer && gAllowed[c];
+        if (o.nonce != m.sellerNonce(o.seller) || block.timestamp < o.start || block.timestamp > o.expiry) {
+            ok = false;
+        } else if (uint256(o.expiry) - o.start > 180 days) {
+            ok = false;
+        }
+        if (!named && !o.acceptFeeChanges && (gFee > o.feeBps || _royBps(c) > o.royaltyBps)) ok = false;
+        if (named && !inSet) ok = false;
+        // the floor: clamp F to the band and move the reference to it
+        (uint256 f, uint256 low) = _band(c, F);
+        if (f == 0) {
+            low = 0;
+        } else {
+            gRef[c] = f > type(uint128).max ? type(uint128).max : f;
+            gRefAt[c] = block.timestamp;
+        }
+        bool valid;
+        (valid, price) = _modelPrice(o, f);
+        if (!valid) return (false, 0, 0, 0); // a malformed rule has no price
+        if (price < (low * gBackstop) / 10_000) ok = false;
+        gOS[o.seller][s.h] = 1;
+        if (!named) {
+            fee = (price * gFee) / 10_000; // the rates of today, not the signed ones
+            roy = (price * _royBps(c)) / 10_000;
+        }
+        GF storage fl = gFlag[c][o.tokenId];
+        if (fl.state != 0) {
+            if (buyer == fl.claimant) {
+                if (price > (fl.paid > gRef[c] ? fl.paid : gRef[c])) ok = false;
+                delete gFlag[c][o.tokenId];
+            } else if (fl.state == 2 || !ack) {
+                ok = false;
+            } else if (clear) {
+                delete gFlag[c][o.tokenId];
+            } else {
+                fl.state = 2;
+                fl.paid = uint96(price);
+            }
+        }
+        if (InvNFT(c).ownerOf(o.tokenId) != o.seller) ok = false;
+        if (!InvNFT(c).isApprovedForAll(o.seller, address(m)) && InvNFT(c).getApproved(o.tokenId) != address(m)) {
+            ok = false;
+        }
+    }
+
+    function _prepItem(SBuy memory x, uint256 i, uint256 r, uint256 bits, uint8 mode)
+        internal
+        returns (M.SignedBuy memory it)
+    {
+        SO storage s = orders[x.slot[i]];
+        it.order = s.o;
+        GF memory fl = gFlag[s.o.collection][s.o.tokenId];
+        x.flagBefore[i] = fl.state;
+        x.claimantBefore[i] = fl.claimant;
+        it.floor = _pickFloor(s.o, r, mode);
+        it.flagAck = fl.state != 0 ? bits % 4 != 0 : bits % 8 == 0;
+        it.clearFlag = (bits >> 3) % 4 == 0;
+        it.authDeadline = uint40(block.timestamp + (r >> 16) % 301);
+        bool ok = true;
+        if (mode % 31 == 9) {
+            // an auth that has expired, or one good for longer than 5 minutes
+            it.authDeadline = uint40((r >> 30) % 2 == 0 ? block.timestamp - 1 : block.timestamp + 301);
+            ok = false;
+        }
+        uint256 ck = gCosigner == csAddrs[1] ? csKeys[1] : csKeys[0];
+        if (mode % 37 == 11) {
+            ck = strangerKey; // not the co-signer
+            ok = false;
+        }
+        uint256 sk = keyOf[s.o.seller];
+        if (mode % 41 == 13 || sk == 0) {
+            sk = strangerKey; // not the seller
+            ok = false;
+        }
+        if (s.o.audienceKind == 1) {
+            if (x.buyer == s.namedA) {
+                if (s.namedB != address(0)) it.proof = _proof(_wleaf(s.namedB));
+            } else {
+                it.proof = _proof(_wleaf(s.namedA));
+            }
+        }
+        bytes32 digest = _authDigest(s.h, x.buyer, it.floor, it.authDeadline, it.flagAck, it.clearFlag);
+        if (digest != m.fillAuthDigest(s.h, x.buyer, it.floor, it.authDeadline, it.flagAck, it.clearFlag)) {
+            x.badDigest = true;
+        }
+        it.sellerSig = _sign(sk, s.h);
+        it.cosignerSig = _sign(ck, digest);
+        bool simOk;
+        (simOk, x.price[i], x.fee[i], x.roy[i]) = _simFill(
+            s, x.buyer, it.floor, it.flagAck, it.clearFlag, x.buyer == s.namedA || (s.namedB != address(0) && x.buyer == s.namedB)
+        );
+        x.simOk[i] = ok && simOk;
+        it.maxPrice = x.price[i] + ((r >> 40) % 3 == 0 ? (r >> 44) % 1 ether : 0);
+        if (mode % 10 == 1 && i == 0 && x.price[i] > 0) {
+            it.maxPrice = x.price[i] - 1; // the order is dearer than the buyer saw
+            x.simOk[i] = false;
+        }
+    }
+
+    /// Fill one or two signed orders. The model decides beforehand whether the fill must succeed, and both
+    /// directions are checked: a fill the rules refuse must revert, and a fill the rules allow must go through.
+    function buySigned(uint256 buyerSeed, uint256 pick, uint256 fSeed, uint256 overpay, uint256 bits, uint8 mode, uint256 tipSeed)
+        external
+    {
+        SBuy memory x;
+        bits = uint256(keccak256(abi.encode(bits, pick))); // spread: the fuzzer favours 0 and max
+        mode = uint8(bits >> 200);
+        x.n = bits % 5 == 0 ? 2 : 1;
+        x.slot[0] = _firstOrder(pick, bits, mode);
+        if (x.n == 2) {
+            x.slot[1] = _secondOrder(x.slot[0], pick, bits, mode);
+            // A smart-wallet seller may act when it is paid. TrickyWallet in mode 3 calls incrementNonce(),
+            // which cancels its own other orders in the middle of the call. With two orders from such a
+            // seller, the second fill is then rightly refused (OrderNotLive), if the wallet had the gas for it.
+            address s0 = orders[x.slot[0]].o.seller;
+            x.lenient = s0 == orders[x.slot[1]].o.seller && s0.code.length != 0 && TrickyWallet(payable(s0)).mode() == 3;
+        }
+        _lastMoment(x, bits);
+        x.buyer = _pickBuyer(orders[x.slot[0]], buyerSeed, mode);
+        Snap memory snap = _snapshot(x);
+        M.SignedBuy[] memory items = new M.SignedBuy[](x.n);
+        x.expectOk = !gPaused && gCosigner != address(0);
+        for (uint256 i; i < x.n; ++i) {
+            items[i] = _prepItem(x, i, uint256(keccak256(abi.encode(fSeed, i))), bits >> (8 * (i + 1)), mode);
+            if (!x.simOk[i]) x.expectOk = false;
+            x.total += x.price[i] + x.fee[i];
+        }
+        // the same token twice in one call: the second transfer cannot happen
+        if (x.n == 2 && _sameToken(x.slot[0], x.slot[1])) x.expectOk = false;
+        uint256 maxTip = (x.total * 500) / 10_000;
+        x.tip = tipSeed % 3 == 0 ? 0 : bound(tipSeed, 0, maxTip);
+        if (mode % 17 == 4) {
+            x.tip = maxTip + 1; // over the 5% cap
+            x.expectOk = false;
+        }
+        x.value = x.total + x.tip + bound(overpay, 0, 2 ether);
+        if (mode % 13 == 3 && x.total + x.tip > 0) {
+            x.value = x.total + x.tip - 1;
+            x.expectOk = false;
+        }
+        vm.deal(x.buyer, x.buyer.balance + x.value);
+        _begin();
+        if (x.badDigest) _v("fillAuthDigest: not the EIP-712 hash of the FillAuth type");
+        for (uint256 i; i < x.n; ++i) {
+            if (!x.simOk[i]) continue;
+            M.Order memory o = items[i].order;
+            // the least the seller nets: all of it on a named-wallet sale; else the price less the royalty
+            // they signed, or less the cap if they accepted rate changes
+            uint256 worstBps = o.audienceKind == 1 ? 0 : o.acceptFeeChanges ? 1000 : o.royaltyBps;
+            _sellerFloor(o.seller, x.price[i] - (x.price[i] * worstBps) / 10_000);
+            _eFloor[_ci(o.collection)] += int256(x.fee[i]);
+            _expRoy(o.collection, x.roy[i]);
+            _exp(o.seller, int256(x.price[i] - x.roy[i]));
+            _move(o.collection, o.tokenId, o.seller, x.buyer);
+        }
+        _exp(x.buyer, -int256(x.total + x.tip));
+        _exp(gTipJar, int256(x.tip));
+        vm.prank(x.buyer);
+        try m.buySigned{value: x.value}(items, x.tip) {
+            x.ok = true;
+        } catch (bytes memory e) {
+            x.err = bytes4(e);
+        }
+        if (x.ok) {
+            if (!x.expectOk) _v("buySigned: filled, but the rules refuse this fill");
+            _afterSignedFill(x, items);
+        } else {
+            if (x.expectOk && !(x.lenient && x.err == M.OrderNotLive.selector)) {
+                _v(string.concat("buySigned: refused a fill the rules allow, error ", vm.toString(x.err)));
+            }
+            _restore(x, snap);
+        }
+        _checkSellerFloors(x.ok, "buySigned");
+        _end(x.ok, "buySigned");
+    }
+
+    /// Checks on a successful signed fill that do not go through _simFill, and the coverage counters.
+    function _afterSignedFill(SBuy memory x, M.SignedBuy[] memory items) internal {
+        if (gPaused) _v("buySigned: while paused");
+        for (uint256 i; i < x.n; ++i) {
+            M.Order memory o = items[i].order;
+            uint256 p = x.price[i];
+            bool named = o.audienceKind == 1;
+            if (p < o.priceMin || p > o.priceMax) _v("buySigned: sold outside [priceMin, priceMax]");
+            if (p > items[i].maxPrice) _v("buySigned: price above the maxPrice the buyer set");
+            if (x.fee[i] * 10_000 > p * 500 || x.roy[i] * 10_000 > p * 1000) _v("buySigned: fee or royalty over the cap");
+            if (named && (x.fee[i] != 0 || x.roy[i] != 0)) _v("buySigned: a named-wallet order was charged");
+            if (!named && !o.acceptFeeChanges && (gFee > o.feeBps || _royBps(o.collection) > o.royaltyBps)) {
+                _v("buySigned: rates above what the seller signed");
+            }
+            if (o.seller == x.buyer) _v("buySigned: self-trade");
+            if (!gAllowed[o.collection]) _v("buySigned: collection not allowed");
+            if (block.timestamp > o.expiry || block.timestamp < o.start) _v("buySigned: outside the time window of the order");
+            if (items[i].authDeadline < block.timestamp || items[i].authDeadline > block.timestamp + 5 minutes) {
+                _v("buySigned: auth outside its 5-minute window");
+            }
+            if (m.orderStatus(o.seller, orders[x.slot[i]].h) != 1) _v("buySigned: order not marked filled");
+            _clearListing(o.collection, o.tokenId); // a signed fill removes the on-chain listing of the token
+            _count(keccak256("buySigned.fills"));
+            if (named) _count(keccak256("buySigned.named"));
+            if (o.floorRef != 0) _count(keccak256("buySigned.floorRule"));
+            if (o.seller.code.length != 0) _count(keccak256("buySigned.1271seller"));
+            if (x.flagBefore[i] != 0) {
+                if (x.buyer == x.claimantBefore[i]) _count(keccak256("buySigned.claimantBuyback"));
+                else if (gFlag[o.collection][o.tokenId].state == 2) _count(keccak256("buySigned.flaggedNowHeld"));
+                else _count(keccak256("buySigned.flagCleared"));
+            }
+        }
+        if (x.n == 2) _count(keccak256("buySigned.batch2"));
+    }
+
+    /// A sale by an on-chain listing or an offer: a flagged or held token may only go to its claimant, at no
+    /// more than max(what the holder paid, the floor reference). That clears the flag.
+    function _plainSaleFlag(address c, uint256 id, address buyer, uint256 price, string memory tag) internal {
+        GF storage fl = gFlag[c][id];
+        if (fl.state == 0) return;
+        if (buyer != fl.claimant) {
+            _v(string.concat(tag, ": a flagged or held token was sold to someone other than its claimant"));
+            return;
+        }
+        if (price > (fl.paid > gRef[c] ? fl.paid : gRef[c])) {
+            _v(string.concat(tag, ": the claimant paid more than max(paid, floor ref)"));
+        }
+        delete gFlag[c][id];
+        _count(keccak256("plain.claimantBuyback"));
+    }
+
+    /// The seller (or someone else) cancels an order by its hash. Only the caller's own order can be affected.
+    function cancelOrders(uint256 aSeed, uint256 pick) external {
+        if (orders.length == 0) return;
+        SO storage s = orders[pick % orders.length];
+        address who = aSeed % 4 == 0 ? actors[(aSeed / 4) % actors.length] : s.o.seller;
+        bool mustFail = gOS[who][s.h] == 1; // already filled
+        bytes32[] memory hs = new bytes32[](1);
+        hs[0] = s.h;
+        _begin();
+        bool ok;
+        vm.prank(who);
+        try m.cancelOrders(hs) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (mustFail) _v("cancelOrders: cancelled a filled order");
+            gOS[who][s.h] = 2;
+            if (m.orderStatus(who, s.h) != 2) _v("cancelOrders: not marked cancelled");
+        } else if (!mustFail) {
+            _v("cancelOrders: reverted");
+        }
+        _end(ok, "cancelOrders");
+    }
+
+    function ownerSetCosigner(uint256 seed) external {
+        seed = uint256(keccak256(abi.encode(seed)));
+        address c = seed % 16 == 0 ? address(0) : csAddrs[(seed >> 8) % 2];
+        _begin();
+        vm.prank(owner);
+        m.setCosigner(c);
+        gCosigner = c;
+        _end(true, "ownerSetCosigner");
+    }
+
+    function ownerSetFlagger(uint256 seed) external {
+        seed = uint256(keccak256(abi.encode(seed)));
+        address f = seed % 16 == 0 ? address(0) : flaggers[(seed >> 8) % 2];
+        _begin();
+        vm.prank(owner);
+        m.setFlagger(f);
+        gFlagger = f;
+        _end(true, "ownerSetFlagger");
+    }
+
+    function ownerSetFloorParams(uint256 fall, uint256 rise, uint256 back, uint8 mode) external {
+        fall = bound(fall, 500, 5000);
+        rise = bound(rise, 500, 100_000);
+        back = bound(back, 0, 5000);
+        bool mustFail = mode % 6 == 0;
+        if (mustFail) {
+            uint256 w = (mode / 6) % 5; // one value just outside its bounds
+            if (w == 0) fall = 499;
+            if (w == 1) fall = 5001;
+            if (w == 2) rise = 499;
+            if (w == 3) rise = 100_001;
+            if (w == 4) back = 5001;
+        }
+        _begin();
+        bool ok;
+        vm.prank(owner);
+        try m.setFloorParams(uint16(fall), uint32(rise), uint16(back)) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (mustFail) _v("setFloorParams: outside the bounds");
+            gFall = uint16(fall);
+            gRise = uint32(rise);
+            gBackstop = uint16(back);
+        } else if (!mustFail) {
+            _v("setFloorParams: owner call reverted");
+        }
+        _end(ok, "ownerSetFloorParams");
+    }
+
+    function ownerSeedFloorRef(uint256 cSeed, uint256 ref) external {
+        address c = address(nfts[cSeed % 3]);
+        ref = ref % 7 == 0 ? 0 : bound(ref, 1e15, 100 ether);
+        bool mustFail = gRef[c] != 0 || ref == 0; // one-time, and never to 0
+        _begin();
+        bool ok;
+        vm.prank(owner);
+        try m.seedFloorRef(c, uint128(ref)) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (mustFail) _v("seedFloorRef: re-seeded, or seeded with 0");
+            gRef[c] = ref;
+            gRefAt[c] = block.timestamp;
+        } else if (!mustFail) {
+            _v("seedFloorRef: owner call reverted");
+        }
+        _end(ok, "ownerSeedFloorRef");
+    }
+
+    /// The flagger (or someone else) flags a token, renames its claimant, or clears it.
+    function flaggerSetFlag(uint256 callerSeed, uint256 cSeed, uint256 idSeed, uint256 claimantSeed, uint8 x) external {
+        address c = address(nfts[cSeed % 3]);
+        uint256 id = idSeed % TOKENS + 1;
+        x = uint8(uint256(keccak256(abi.encode(x, idSeed))));
+        if (x % 2 == 0 && orders.length > 0) {
+            // mostly a token somebody has signed an order for
+            c = orders[idSeed % orders.length].o.collection;
+            id = orders[idSeed % orders.length].o.tokenId;
+        }
+        bool flagged = x % 5 < 2;
+        if (!flagged && x % 4 < 2) {
+            // a clear mostly aims at a token that is flagged, so flags stay few and the other paths keep trading
+            (bool has, address fc, uint256 fid) = _findFlagged(idSeed);
+            if (has) (c, id) = (fc, fid);
+        }
+        address caller =
+            (callerSeed % 4 != 0 && gFlagger != address(0)) ? gFlagger : tracked[callerSeed % tracked.length];
+        address claimant = claimantSeed % 4 == 0 ? address(0) : actors[claimantSeed % actors.length];
+        _begin();
+        bool ok;
+        vm.prank(caller);
+        try m.setFlag(c, id, flagged, claimant) {
+            ok = true;
+        } catch {}
+        if (ok) {
+            if (caller != gFlagger) _v("setFlag: someone other than the flagger set a flag");
+            if (!flagged) {
+                delete gFlag[c][id];
+            } else {
+                if (gFlag[c][id].state == 0) gFlag[c][id].state = 1; // a held token keeps its hold
+                gFlag[c][id].claimant = claimant;
+            }
+        } else if (caller == gFlagger) {
+            _v("setFlag: the flagger call reverted");
+        }
+        _end(ok, "flaggerSetFlag");
+    }
+
+    /// "" when the signed-listing storage matches the model, else what differs.
+    function signedStateMismatch() public view returns (string memory) {
+        if (m.cosigner() != gCosigner) return "cosigner";
+        if (m.flagger() != gFlagger) return "flagger";
+        if (m.floorFallBpsPerDay() != gFall || m.floorRiseBpsPerDay() != gRise || m.floorBackstopBps() != gBackstop) {
+            return "floor params";
+        }
+        if (gFall < 500 || gFall > 5000 || gRise < 500 || gRise > 100_000 || gBackstop > 5000) {
+            return "floor params out of bounds";
+        }
+        for (uint256 c; c < 3; ++c) {
+            address col = address(nfts[c]);
+            (uint128 ref, uint40 at) = m.floorRefs(col);
+            if (ref != gRef[col] || at != gRefAt[col]) return "floor reference";
+            for (uint256 id = 1; id <= TOKENS; ++id) {
+                (uint8 st, uint96 paid, address cl) = m.flags(col, id);
+                GF storage g = gFlag[col][id];
+                if (st != g.state || paid != g.paid || cl != g.claimant) return "flag";
+            }
+        }
+        for (uint256 i; i < orders.length; ++i) {
+            if (m.orderStatus(orders[i].o.seller, orders[i].h) != gOS[orders[i].o.seller][orders[i].h]) {
+                return "order status";
+            }
+        }
+        return "";
     }
 
     function _one(uint256 x) internal pure returns (uint256[] memory r) {
@@ -1392,7 +2244,7 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         h = new Handler();
         m = h.m();
         targetContract(address(h));
-        bytes4[] memory s = new bytes4[](46);
+        bytes4[] memory s = new bytes4[](61);
         s[0] = Handler.list.selector;
         s[1] = Handler.delist.selector;
         s[2] = Handler.incrementNonce.selector;
@@ -1441,6 +2293,22 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         s[43] = Handler.withdrawRoyaltyFund.selector;
         s[44] = Handler.ownerSetCreatorAllowance.selector;
         s[45] = Handler.setCollectionOwner.selector;
+        // signed listings, the floor reference and flags
+        s[46] = Handler.signOrder.selector;
+        s[47] = Handler.signOrder.selector;
+        s[48] = Handler.signOrder.selector;
+        s[49] = Handler.buySigned.selector;
+        s[50] = Handler.buySigned.selector;
+        s[51] = Handler.buySigned.selector;
+        s[52] = Handler.buySigned.selector;
+        s[53] = Handler.buySigned.selector;
+        s[54] = Handler.cancelOrders.selector;
+        s[55] = Handler.ownerSetCosigner.selector;
+        s[56] = Handler.ownerSetFlagger.selector;
+        s[57] = Handler.ownerSetFloorParams.selector;
+        s[58] = Handler.ownerSeedFloorRef.selector;
+        s[59] = Handler.flaggerSetFlag.selector;
+        s[60] = Handler.flaggerSetFlag.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: s}));
     }
 
@@ -1562,19 +2430,26 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
         }
     }
 
+    /// Signed listings: the co-signer, flagger, floor parameters (within their bounds), every floor reference,
+    /// every flag and every tracked order's status are what the independent model says.
+    function invariant_signedStateMatchesModel() public view {
+        assertEq(h.signedStateMismatch(), "", "signed-listing storage != model");
+    }
+
     function afterInvariant() public view {
         uint256 k = h.callKeyCount();
-        string[30] memory names = [
+        string[35] memory names = [
             "list", "delist", "incrementNonce", "clearStale", "buy", "placeOffer", "acceptOffer", "cancelOffer",
             "withdraw", "ownerSetFee", "ownerSetDefaultRoyalty", "ownerRegisterRoyalty", "ownerTriesRenounce",
             "withdrawFloorFund", "ownerSetAllowed", "ownerPause", "ownerRefundOffers", "strangerAdmin",
             "creatorRegisterRoyalty", "ownerSetSelfServeBlocked", "withdrawFor", "ownerSetGuardian", "guardianPause",
             "listPrivate", "ownerSetTipJar", "withdrawRoyaltyFund", "ownerSetCreatorAllowance",
-            "", "", ""
+            "buySigned", "cancelOrders", "ownerSetCosigner", "ownerSetFlagger", "ownerSetFloorParams",
+            "ownerSeedFloorRef", "flaggerSetFlag", ""
         ];
         k;
         console2.log("self-serve royalties present in this build", h.selfServe());
-        for (uint256 i; i < 27; ++i) {
+        for (uint256 i; i < 34; ++i) {
             console2.log(
                 names[i],
                 h.calls(keccak256(abi.encodePacked(names[i], ".ok"))),
@@ -1582,6 +2457,12 @@ contract MarketplaceV3InvariantTest is StdInvariant, Test {
             );
         }
         console2.log("pending total wallets / escrow", address(m).balance, h.ghostEscrow());
+        console2.log("signed orders made / filled", h.calls("signOrder"), h.calls(keccak256("buySigned.fills")));
+        console2.log("  named / floor rule / ERC-1271 seller", h.calls(keccak256("buySigned.named")), h.calls(keccak256("buySigned.floorRule")), h.calls(keccak256("buySigned.1271seller")));
+        console2.log("  two in one call", h.calls(keccak256("buySigned.batch2")));
+        console2.log("  flagged: now held / cleared / claimant buy-back", h.calls(keccak256("buySigned.flaggedNowHeld")), h.calls(keccak256("buySigned.flagCleared")), h.calls(keccak256("buySigned.claimantBuyback")));
+        console2.log("claimant buy-backs by listing or offer", h.calls(keccak256("plain.claimantBuyback")));
+        console2.log("flagged just before a fill (fills that went through)", h.calls(keccak256("buySigned.pre.flag")));
     }
 }
 
@@ -2191,6 +3072,14 @@ contract MarketplaceV3PropertyHarness is Handler {
 
     function echidna_capsHold() external view returns (bool) {
         return _capsOk();
+    }
+
+    function property_signedStateMatchesModel() external view returns (bool) {
+        return bytes(signedStateMismatch()).length == 0;
+    }
+
+    function echidna_signedStateMatchesModel() external view returns (bool) {
+        return bytes(signedStateMismatch()).length == 0;
     }
 }
 

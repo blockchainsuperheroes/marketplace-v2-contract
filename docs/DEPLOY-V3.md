@@ -19,11 +19,35 @@ A professional audit comes before third-party collections are allowed.
 - [ ] **Deployer**: a fresh throwaway wallet with about 0.01 ETH.
   - It owns the contract only during the script, then hands ownership to 0xB2e3 (two-step).
 
+## Added by signed listings (c491f88, not deployed, not audited)
+
+The checklist above was written for the on-chain-listing version. The signed-listing version (`docs/SIGNED-LISTINGS.md`) adds these, all still open:
+
+- [ ] **The launch list** is no longer "our own NFTs only". It is the 14 LAUNCH collections in `docs/RIGHTS-REGISTER-ETH.md` that nft-data also marks `supported`. So the audit comes **before** this deploy, not after it.
+- [ ] **Audit re-run** on the signed version. `docs/AUDIT-SELF-REVIEW.md` still describes `66ef13d`. The invariant handler now covers signed listings (see "Tests" in `SIGNED-LISTINGS.md`). Medusa, Echidna, Halmos and the full-size runs are not redone yet. Then the external audit.
+- [ ] **Co-signer key** (`COSIGNER`): a KMS key, created through AWS Admin on nftprof's confirmation. Re-derive its address from `GetPublicKey`. Until it is set, signed orders can't be filled; on-chain listings and offers work.
+- [ ] **Co-signer service** (CI/CD session): the checks in "What the co-signer must refuse".
+- [ ] **Flagger** (`FLAGGER`): who holds it is open question 3.
+- [ ] **Floor seeds** (`FLOOR_COLLECTIONS`, `FLOOR_REFS_WEI`): the clean floor of each launch collection, taken on deploy day. Seeding is one-time per collection. An unseeded collection takes the co-signer's first number as given.
+- [ ] **Size:** 24,438 of 24,576 bytes at `optimizer_runs = 200`. An audit fix that adds code needs open question 5 answered first.
+
+The deploy script takes the three settings as optional env vars and applies them before the handover. Anything left out is set later by 0xB2e3 (`setCosigner`, `setFlagger`, `seedFloorRef`). A local dry run of the script uses about 5.9M gas.
+
+**Extra checks right after:**
+- `cosigner()` and `flagger()` are right;
+- `floorFallBpsPerDay()` is 2000, `floorRiseBpsPerDay()` is 5000 and `floorBackstopBps()` is 1000;
+- `floorRefs(c)` is set for each seeded collection.
+
+**Extra smoke test:** sign an order, fill it with a FillAuth, and cancel a second one by its hash.
+
+**Extra emergency lever:** `setCosigner(address(0))` stops every signed fill at once. On-chain listings, offers, cancels and withdrawals keep working.
+
 ## Deploy
 
 ```bash
 TIP_JAR=0x… COLLECTIONS=0x…,0x… \
 ROYALTY_COLLECTIONS=0x… ROYALTY_RECEIVERS=0x… ROYALTY_BPS_LIST=500 \
+COSIGNER=0x… FLAGGER=0x… FLOOR_COLLECTIONS=0x…,0x… FLOOR_REFS_WEI=…,… \
 forge script script/DeployMarketplaceV3.s.sol --rpc-url $ETH_RPC --broadcast --verify \
   --private-key-file <throwaway key file>   # or --ledger
 ```
