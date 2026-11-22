@@ -85,6 +85,7 @@ The two KMS keys for automatic release (`alias/redeem-release-keeper`, `alias/re
   - the release desk shows an amber line: "Automatic release is paused, waiting for an admin. Manual release still works.";
   - the buyer's claim card says "Delivery is being reviewed" in place of a delivery time.
 - **A pause loses nothing.** The claim can still be released by hand, and the buyer can reclaim after 7 days.
+- **Reading a key's public address is safe** (ACT2, 2026-11-21): the pause watches only `Sign`, so `GetPublicKey` and `DescribeKey` from a box never trip it. A pause only attaches a deny-Sign policy to the box role; it never disables or deletes a key.
 - **A pause must never schedule the verifier key for deletion.** Its address is fixed in `RedeemReleaseAdmin`; a new key means a new contract and a 48h role change on each locker.
 
 ## The buyer's journey on a held claim
