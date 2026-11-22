@@ -74,6 +74,19 @@ On `market13.pentagon.games/admin/release` (CI/CD owns this page), every waiting
 - **Data source:** the indexer computes the gates server-side (`/vip/release_check` with the key from server env, plus `pooledFunds.mjs`) and caches them per drop for about 10 minutes. The page never sees the key.
 - **Held list:** drops on it (today, drop 13) always show red, with the reason, even if a lookup is down.
 
+## The signer auto-pause (AWS Admin ACT2, 2026-11-21)
+
+The two KMS keys for automatic release (`alias/redeem-release-keeper`, `alias/redeem-release-verifier`) sit on the Bridge2 boxes, which the EtherFantasy land-sale signers now share. nftprof approved a shared AWS auto-pause there (Lambda `signer-auto-pause`). Record: `C:\Users\ADMIN\Desktop\ACCT1-MIGRATION\signer-watch\`.
+
+- **Today any signature with either redeem key counts as misuse** (`REDEEM_LIVE=false`), because automatic release isn't deployed. One signature pauses ALL signing on that box (bridge, land sale and redeem) until an admin reviews.
+- **Before the first signature from a box, tell AWS Admin ACT2:** a test signature, the deploy, anything. It then sets `REDEEM_LIVE=true` and adds our SDK user agent. Skipping this pauses the bridge.
+- **Manual release is not affected.** nftprof signs from 0xB2e3, and the release is sent by the keeper key on the pg-pfpvault box, which is neither of these keys.
+- **Status for the pages:** `https://d31l8rwq7d85js.cloudfront.net/status/signers.json`. When `stacks.redeem` is `"paused"`:
+  - the release desk shows an amber line: "Automatic release is paused, waiting for an admin. Manual release still works.";
+  - the buyer's claim card says "Delivery is being reviewed" in place of a delivery time.
+- **A pause loses nothing.** The claim can still be released by hand, and the buyer can reclaim after 7 days.
+- **A pause must never schedule the verifier key for deletion.** Its address is fixed in `RedeemReleaseAdmin`; a new key means a new contract and a 48h role change on each locker.
+
 ## The buyer's journey on a held claim
 
 nftprof, 2026-11-09: the buyer is guided step by step: create an account, then become a paying member, and only then told about pooled PC. One step on screen at a time.
